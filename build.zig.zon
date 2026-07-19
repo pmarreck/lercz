@@ -1,0 +1,14 @@
+.{
+	.name = .lercz,
+	.version = "4.1.1",
+	.minimum_zig_version = "0.16.0",
+	.paths = .{
+		"build.zig",
+		"build.zig.zon",
+		"src",
+		"LICENSE",
+		"NOTICE",
+		"README.md",
+	},
+	.fingerprint = 0x3f6d761891fc5acb,
+}

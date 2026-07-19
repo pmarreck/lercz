@@ -26,6 +26,11 @@ bin/
 
 cmake
 
+.zig-cache/
+zig-out/
+result
+result-*
+
 OtherLanguages/Python/lerc/*.dll
 OtherLanguages/Python/lerc/*.lib
 OtherLanguages/Python/lerc/*.dylib
