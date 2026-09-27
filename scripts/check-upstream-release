@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Compare the bundled codec's own version with GitHub's latest stable release.
+set -u
+
+case "${1-}" in
+	-h|--help)
+		printf 'Usage: scripts/check-upstream-release\nCheck Esri/LERC live; exit 1 if outdated, 2 if unverifiable.\n'
+		exit 0 ;;
+	'') ;;
+	*) printf 'Unexpected argument: %s\n' "$1" >&2; exit 2 ;;
+esac
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd) || exit 2
+for tool in curl jq; do
+	if ! command -v "$tool" >/dev/null 2>&1; then
+		printf 'Cannot verify upstream LERC: missing %s; run inside nix develop.\n' "$tool" >&2
+		exit 2
+	fi
+done
+
+# Read the codec header, never the fork's separately editable package version.
+bundled=$(jq -ner --rawfile header "$repo/src/LercLib/include/Lerc_c_api.h" '
+	["MAJOR", "MINOR", "PATCH"] | map(. as $part |
+		[$header | scan("(?m)^#define[ \\t]+LERC_VERSION_" + $part + "[ \\t]+([0-9]+)[ \\t]*\\r?$") | .[0]] |
+		if length == 1 then .[0] else error("missing or duplicate version component") end
+	) | join(".")
+' 2>/dev/null) || {
+	printf 'Cannot read bundled LERC version from src/LercLib/include/Lerc_c_api.h.\n' >&2
+	exit 2
+}
+
+# No persisted success cache: every invocation checks upstream, with bounded I/O.
+release=$(curl --fail --silent --show-error --location \
+	--proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 \
+	--header 'Accept: application/vnd.github+json' \
+	--header 'X-GitHub-Api-Version: 2022-11-28' \
+	--header 'Cache-Control: no-cache' \
+	https://api.github.com/repos/Esri/lerc/releases/latest) || {
+	printf 'Cannot verify latest upstream LERC release; build refused. Check network/API availability and retry.\n' >&2
+	exit 2
+}
+
+latest=$(jq -ser '
+	if length != 1 then error("expected one release") else .[0] end |
+	select(type == "object" and .draft == false and .prerelease == false) |
+	.tag_name | select(type == "string") |
+	capture("^v?(?<version>(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*))$") | .version
+' <<< "$release" 2>/dev/null) || {
+	printf 'Cannot verify latest upstream LERC release: invalid stable-release response; build refused.\n' >&2
+	exit 2
+}
+
+if jq -ne --arg bundled "$bundled" --arg latest "$latest" \
+	'($bundled | split(".") | map(tonumber)) >= ($latest | split(".") | map(tonumber))' >/dev/null; then
+	printf 'Upstream release check passed: bundled LERC %s, latest stable %s.\n' "$bundled" "$latest" >&2
+else
+	printf 'Bundled LERC %s is behind upstream %s; build refused.\n' "$bundled" "$latest" >&2
+	printf 'Import the upstream release source, update package versions, and run ./test.\n' >&2
+	printf 'Release: https://github.com/Esri/lerc/releases\n' >&2
+	exit 1
+fi

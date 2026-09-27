@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Keep the live policy check outside Zig's cache and Nix's offline sandbox.
+set -u
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 2
+backend=nix
+case "${1-}" in
+	-h|--help)
+		printf 'Usage: ./build-checked [--backend=nix|direct] [--] [build arguments...]\n'
+		printf 'Check upstream LERC, then run nix build (default) or zig build.\n'
+		exit 0 ;;
+	--backend=*) backend=${1#--backend=}; shift ;;
+esac
+if [[ ${1-} == -- ]]; then shift; fi
+case "$backend" in
+	nix|direct) ;;
+	*) printf 'Unknown backend: %s\n' "$backend" >&2; exit 2 ;;
+esac
+
+"$repo/scripts/check-upstream-release" || exit $?
+cd -- "$repo" || exit 2
+case "$backend" in
+	nix) exec nix build . "$@" ;;
+	direct) exec zig build "$@" ;;
+esac

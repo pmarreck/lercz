@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# The deterministic suite stays usable offline while updating stale sources.
+set -u
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")" || exit 1
+failures=0
+bash tests/cli/upstream-release || failures=$((failures + 1))
+zig build test "$@" || failures=$((failures + 1))
+exit "$failures"

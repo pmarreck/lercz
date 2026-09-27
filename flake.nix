@@ -11,10 +11,9 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, zig-overlay }:
-    flake-utils.lib.eachDefaultSystem (system:
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        isLinux = pkgs.stdenv.isLinux;
         zig = zig-overlay.packages.${system}."0.16.0";
 
         # Match tiffz's portfolio convention: on Linux, build a fully
@@ -33,15 +32,15 @@
           src = ./.;
           nativeBuildInputs = [ zig ];
           buildPhase = ''
-            export HOME=$TMPDIR
             export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
+            export ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local-cache
             mkdir -p $ZIG_GLOBAL_CACHE_DIR
             zig build -Doptimize=ReleaseFast ${zigTargetFlag}
           '';
           installPhase = ''
             mkdir -p $out/lib $out/include
-            cp -v zig-out/lib/*  $out/lib/     2>/dev/null || true
-            cp -v zig-out/include/* $out/include/ 2>/dev/null || true
+            cp -v zig-out/lib/liblerc.a $out/lib/
+            cp -v zig-out/include/Lerc_c_api.h zig-out/include/Lerc_types.h $out/include/
           '';
           dontFixup = true;
         };
@@ -50,12 +49,13 @@
           pname = "${pname}-test";
           inherit version;
           src = ./.;
-          nativeBuildInputs = [ zig ];
+          nativeBuildInputs = [ zig pkgs.bash pkgs.jq pkgs.coreutils pkgs.gnugrep ];
           buildPhase = ''
-            export HOME=$TMPDIR
             export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
+            export ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local-cache
             mkdir -p $ZIG_GLOBAL_CACHE_DIR
-            timeout 600 zig build test ${zigTargetFlag} || {
+            patchShebangs test build-checked scripts tests
+            timeout 600 bash ./test ${zigTargetFlag} || {
               echo "lercz test suite failed"
               exit 1
             }
@@ -76,7 +76,7 @@
         };
 
         devShells.default = pkgs.mkShell {
-          buildInputs = [ zig ];
+          packages = [ zig pkgs.bash pkgs.curl pkgs.jq pkgs.coreutils pkgs.gnugrep pkgs.shellcheck ];
           shellHook = ''
             echo "lercz dev shell (Zig ${zig.version}, LERC ${version})"
           '';

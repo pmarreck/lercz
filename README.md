@@ -1,4 +1,116 @@
-# LERC - Limited Error Raster Compression
+# lercz — LERC for Zig and Nix
+
+[![Mechatron Prime CI](https://img.shields.io/endpoint?url=https%3A%2F%2Fthelio-nixos.tail66c90.ts.net%2Fbadges%2Flercz.json&style=for-the-badge)](https://thelio-nixos.tail66c90.ts.net/mechatron-prime/)
+
+`lercz` is Peter Marreck's fork of [Esri/LERC](https://github.com/Esri/lerc),
+packaged for Zig projects such as `tiffz`. It follows the `zstdz` pattern:
+build the original C++ codec with Zig and expose its C API through a thin Zig
+module, keeping upstream codec changes easy to import.
+
+LERC (Limited Error Raster Compression) compresses numerical raster data,
+including integer and floating-point pixels. Callers set a maximum error per
+pixel: zero gives lossless compression; a positive bound trades precision for
+smaller output. Elevation maps and scientific imagery are typical uses.
+
+## What this fork adds
+
+- **Zig build and package:** `build.zig` compiles the C++ sources, installs the
+  library and public headers, and exports the `lercz` module. Builds default
+  to `ReleaseFast` and static linkage; target, optimization, and linkage are
+  configurable. The package currently requires Zig 0.16.0 or newer.
+- **Thin Zig interface:** `src/lercz.zig` exposes the C API as `lercz.c.*` and
+  adds data-type/error constants. Consumers retain control of allocation and
+  error handling. The codec remains upstream C++, including its exceptions.
+- **Nix packaging:** `flake.nix` supplies Zig, a development shell, library
+  packages, and build/test checks. `flake.lock` pins the inputs. The flake
+  targets Linux x86_64/aarch64 and macOS aarch64; Linux packages use musl.
+- **Additional Zig tests:** checks for exported constants, C linkage through
+  compressed-size calculation, and a byte-exact lossless encode/decode round
+  trip. These supplement the upstream samples and tests.
+- **Upstream-release gate:** the supported build command refuses outdated
+  LERC source and refuses to build when it cannot verify the latest release.
+  Offline tests cover its version comparison, error handling, and enforcement.
+
+For future contributors and agents, [INTENT.md](INTENT.md) records the fork's
+purpose, boundaries, and success criteria.
+
+## Building and testing the fork
+
+Enter the pinned development environment, then use the checked build command:
+
+```sh
+nix develop
+./build-checked                         # Live release check, then nix build
+./build-checked --backend=direct        # Live release check, then zig build
+./build-checked --backend=direct -- -Doptimize=ReleaseSafe
+./test                                  # Offline gate tests plus Zig tests
+nix flake check                         # Sandboxed library build and test suite
+```
+
+The Nix package contains `lib/liblerc.a` and the public headers under `include/`.
+Direct Zig builds install into `zig-out/`. For a cross-build, pass Zig's target
+option, for example `./build-checked --backend=direct -- -Dtarget=aarch64-linux-musl`.
+Use a distinct `--prefix` when retaining artifacts for multiple targets.
+
+With Zig 0.16.0+, Bash, curl, jq, and standard Unix tools already installed,
+`./build-checked --backend=direct` also works without Nix. Gate tests require
+GNU coreutils (`sort -V`); the Nix shell supplies them. We retain upstream's
+`build/` directory, hence the command name `build-checked` rather than `build`.
+
+### Release gate and offline maintenance
+
+`scripts/check-upstream-release` queries GitHub's
+[latest stable LERC release](https://github.com/Esri/lerc/releases/latest) on
+every invocation. It compares that release's numeric version with
+`LERC_VERSION_MAJOR/MINOR/PATCH` in the bundled `Lerc_c_api.h`. Equal or newer
+source versions pass; older versions stop the build before invoking either
+backend. Package-version strings in `build.zig.zon` or `flake.nix` cannot make
+outdated codec headers pass.
+
+Network errors, API rate limits, and missing or malformed release metadata also
+stop the build. Requests have a 30-second timeout, and no successful result is
+persisted for reuse. The standalone checker exits 1 for outdated source and 2
+when verification is impossible. It follows GitHub's latest stable release,
+not unreleased commits, prereleases, or the JavaScript package's version.
+
+Nix derivations remain reproducible and run without network access. Therefore
+the live check runs in `./build-checked`, outside the sandbox and before Nix can
+reuse a cached package. **Raw `nix build`, `nix flake check`, `zig build`, and
+upstream CMake builds do not perform the live release check.** They remain
+available for offline maintenance; dependencies embedding `lercz` also use the
+offline Zig graph. Use `./build-checked` for freshness-enforced builds, including
+in CI before sandboxed checks. The deterministic `./test` suite remains usable
+when the fork is stale so an upstream update can be tested.
+
+The Mechatron badge reports the offline Linux package build and test suite
+listed in `.mechatron-prime/targets`; it does not certify upstream freshness.
+
+When the gate reports a newer release, import the upstream source changes,
+reconcile the wrapper, synchronize package versions, and run `./test` and
+`nix flake check`. Then rerun `./build-checked`. The gate checks declared codec
+versions; it does not prove that all upstream commits were incorporated.
+
+## Using the Zig module
+
+Add this repository at a pinned revision to your Zig dependencies. In your
+consumer's `build.zig`, obtain its module and import it into your own module:
+
+```zig
+const lercz = b.dependency("lercz", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("lercz", lercz.module("lercz"));
+```
+
+Then use `const lercz = @import("lercz");` and call functions such as
+`lercz.c.lerc_encode` and `lercz.c.lerc_decode`. See the round-trip test in
+[src/lercz.zig](src/lercz.zig) for a complete example.
+
+## Upstream documentation
+
+The following documentation describes Esri's LERC library and language
+bindings. Build instructions in this section are upstream interfaces.
 
 ## What is LERC?
 
@@ -135,4 +247,3 @@ Unless required by applicable law or agreed to in writing, software distributed 
 See the License for the specific language governing permissions and limitations under the License.
 
 A copy of the license is available in the repository's [LICENSE](./LICENSE) file.
-

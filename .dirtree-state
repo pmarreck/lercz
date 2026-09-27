@@ -1,0 +1,13 @@
+# Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
+ver=1.2
+annotate=[
+	.mechatron-prime/targets = Exact-commit Mechatron targets for offline Linux package and tests
+	INTENT.md = Stable purpose, scope, constraints, and success criteria for future agents
+	PLAN.md = Current fork documentation and upstream gate work
+	README.md = Fork purpose, Zig/Nix usage, release gate, and preserved upstream documentation
+	build-checked = Live upstream-release preflight before Nix or direct Zig builds
+	flake.lock = Pinned Nix inputs for repeatable toolchain and package builds
+	scripts/check-upstream-release = Fail-closed check of bundled codec version against latest Esri release
+	test = Run the offline gate tests and Zig codec tests
+	tests/cli/upstream-release = Offline version-ordering and build-gate enforcement tests
+]

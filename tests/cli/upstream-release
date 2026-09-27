@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Exercise the real commands with an injected HTTP transport and build tools.
+set -u
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd) || exit 1
+scratch=$(mktemp -d) || exit 1
+trap 'rm -rf -- "$scratch"' EXIT
+fixture="$scratch/repo with spaces"
+mkdir -p "$fixture/scripts" "$fixture/src/LercLib/include" "$scratch/bin"
+cp "$repo/scripts/check-upstream-release" "$fixture/scripts/" || exit 1
+cp "$repo/build-checked" "$fixture/" || exit 1
+printf '#!%s\n' "$(command -v bash)" > "$scratch/bin/curl"
+cat >> "$scratch/bin/curl" <<'SH'
+printf '%s\n' "$*" >> "$HTTP_LOG"
+printf '%s' "$RELEASE_JSON"
+exit "$HTTP_STATUS"
+SH
+printf '#!%s\n' "$(command -v bash)" > "$scratch/bin/nix"
+cat >> "$scratch/bin/nix" <<'SH'
+printf '%s\n' "$PWD" "$@" >> "$BUILD_LOG"
+exit "$BUILD_STATUS"
+SH
+cp "$scratch/bin/nix" "$scratch/bin/zig"
+chmod +x "$scratch/bin/curl" "$scratch/bin/nix" "$scratch/bin/zig"
+export PATH="$scratch/bin:$PATH"
+export HTTP_LOG="$scratch/http.log" BUILD_LOG="$scratch/build.log"
+export HTTP_STATUS=0 BUILD_STATUS=0 RELEASE_JSON=''
+failures=0
+checks=0
+
+# Pin expected outcomes from the contract, including failure diagnostics.
+expect() {
+	local expected=$1 needle=$2 output status
+	shift 2
+	output=$("$@" 2>&1)
+	status=$?
+	checks=$((checks + 1))
+	if [[ $status != "$expected" || $output != *"$needle"* ]]; then
+		printf 'FAIL: expected exit %s and %q; got %s: %s\n' "$expected" "$needle" "$status" "$output" >&2
+		failures=$((failures + 1))
+	fi
+}
+
+set_local() {
+	local major minor patch
+	IFS=. read -r major minor patch <<< "$1"
+	printf '#define LERC_VERSION_MAJOR %s\n#define LERC_VERSION_MINOR %s\n#define LERC_VERSION_PATCH %s\n' \
+		"$major" "$minor" "$patch" > "$fixture/src/LercLib/include/Lerc_c_api.h"
+}
+
+set_release() {
+	RELEASE_JSON=$(jq -cn --arg tag "$1" '{tag_name:$tag, draft:false, prerelease:false}')
+}
+
+# Differential comparison: GNU version-sort supplies the ordering oracle.
+versions=(0.0.0 3.9.9 4.1.1 4.2.0 4.10.0 5.0.0 10.0.0)
+for bundled in "${versions[@]}"; do
+	set_local "$bundled"
+	for latest in "${versions[@]}"; do
+		set_release "v$latest"
+		greatest=$(printf '%s\n%s\n' "$bundled" "$latest" | sort -V | tail -n 1)
+		if [[ $greatest == "$bundled" ]]; then
+			expect 0 'Upstream release check passed' "$fixture/scripts/check-upstream-release"
+		else
+			expect 1 'is behind' "$fixture/scripts/check-upstream-release"
+		fi
+	done
+done
+
+set_local 4.1.1
+set_release 4.1.1
+expect 0 'Upstream release check passed' "$fixture/scripts/check-upstream-release"
+for invalid in '{}' 'null' '[]' '{' \
+	'{"tag_name":"v4.1.1","draft":true,"prerelease":false}' \
+	'{"tag_name":"v4.1.1","draft":false,"prerelease":true}' \
+	'{"tag_name":"v4.1.1"}' \
+	'{"tag_name":"v4.2.0-rc1","draft":false,"prerelease":false}' \
+	'{"tag_name":42,"draft":false,"prerelease":false}' \
+	'{"tag_name":"v4.1.1","draft":false,"prerelease":false} {}'; do
+	RELEASE_JSON=$invalid
+	expect 2 'Cannot verify' "$fixture/scripts/check-upstream-release"
+done
+set_release v4.1.1
+HTTP_STATUS=22
+expect 2 'Cannot verify' "$fixture/scripts/check-upstream-release"
+HTTP_STATUS=28
+expect 2 'Cannot verify' "$fixture/scripts/check-upstream-release"
+HTTP_STATUS=0
+printf 'not a version header\n' > "$fixture/src/LercLib/include/Lerc_c_api.h"
+expect 2 'Cannot read' "$fixture/scripts/check-upstream-release"
+set_local 4.1.1
+
+# The outer build must stop before invoking either backend, even on repeated runs.
+for backend in nix direct; do
+	: > "$BUILD_LOG"
+	set_release v4.2.0
+	expect 1 'is behind' "$fixture/build-checked" "--backend=$backend"
+	if [[ -s $BUILD_LOG ]]; then failures=$((failures + 1)); echo 'FAIL: stale build ran' >&2; fi
+	set_release v4.1.1
+	HTTP_STATUS=28
+	expect 2 'Cannot verify' "$fixture/build-checked" "--backend=$backend"
+	if [[ -s $BUILD_LOG ]]; then failures=$((failures + 1)); echo 'FAIL: unverified build ran' >&2; fi
+	HTTP_STATUS=0
+	expect 0 'Upstream release check passed' "$fixture/build-checked" "--backend=$backend" -- 'argument with spaces'
+	if ! grep -Fxq 'argument with spaces' "$BUILD_LOG" || ! grep -Fxq "$fixture" "$BUILD_LOG"; then
+		failures=$((failures + 1)); echo 'FAIL: backend arguments or working directory changed' >&2
+	fi
+	BUILD_STATUS=7
+	expect 7 'Upstream release check passed' "$fixture/build-checked" "--backend=$backend"
+	BUILD_STATUS=0
+	: > "$BUILD_LOG"
+	set_release v4.2.0
+	expect 1 'is behind' "$fixture/build-checked" "--backend=$backend"
+	if [[ -s $BUILD_LOG ]]; then failures=$((failures + 1)); echo 'FAIL: cached success bypassed gate' >&2; fi
+done
+expect 2 'Unknown backend' "$fixture/build-checked" --backend=typo
+expect 0 'Usage:' "$fixture/build-checked" --help
+expect 0 'Usage:' "$fixture/scripts/check-upstream-release" --help
+
+if ! grep -q 'https://api.github.com/repos/Esri/lerc/releases/latest' "$HTTP_LOG"; then
+	failures=$((failures + 1)); echo 'FAIL: wrong upstream endpoint' >&2
+fi
+if (( failures )); then
+	printf '%s upstream-release checks failed\n' "$failures" >&2
+	exit 1
+fi
+printf 'Passed %s upstream-release checks (offline).\n' "$checks"
