@@ -1,6 +1,6 @@
 .{
 	.name = .lercz,
-	.version = "4.1.1",
+	.version = "4.2.0",
 	.minimum_zig_version = "0.16.0",
 	.paths = .{
 		"build.zig",

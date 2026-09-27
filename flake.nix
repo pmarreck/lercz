@@ -25,7 +25,7 @@
         zigTargetFlag = if zigTarget == null then "" else "-Dtarget=${zigTarget}";
 
         pname = "lercz";
-        version = "4.1.1";
+        version = "4.2.0";
 
         lerczPackage = pkgs.stdenv.mkDerivation {
           inherit pname version;

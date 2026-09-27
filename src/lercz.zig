@@ -37,6 +37,7 @@ pub const err_wrong_param: c_uint = 2;
 pub const err_buffer_too_small: c_uint = 3;
 pub const err_nan: c_uint = 4;
 pub const err_has_no_data: c_uint = 5;
+pub const err_dimensions_too_large: c_uint = 6;
 
 // ---- Smoke test ----
 
@@ -99,4 +100,24 @@ test "lercz.c: uint8 lossless encode -> decode round-trip is byte-exact" {
 		blob.ptr, written, 0, null, 1, 8, 8, 1, dt_uchar, &decoded[0],
 	));
 	try std.testing.expectEqualSlices(u8, &src, &decoded);
+}
+
+test "lercz.c: reject oversized decode dimensions before reading data" {
+	// LERC 4.2 limits uncompressed data per band to INT_MAX bytes. These
+	// requests exceed that limit through pixel count, depth, or element size.
+	const cases = [_]struct { dtype: c_uint, depth: c_int, cols: c_int, rows: c_int }{
+		.{ .dtype = dt_uchar, .depth = 1, .cols = 65536, .rows = 32768 },
+		.{ .dtype = dt_uchar, .depth = 2, .cols = 32768, .rows = 32768 },
+		.{ .dtype = dt_float, .depth = 1, .cols = 32768, .rows = 16384 },
+		.{ .dtype = dt_double, .depth = 1, .cols = 16384, .rows = 16384 },
+	};
+	const blob = [_]u8{0};
+	var output: f64 = 123;
+	for (cases) |case| {
+		const status = c.lerc_decode(
+			&blob, blob.len, 0, null, case.depth, case.cols, case.rows, 1, case.dtype, &output,
+		);
+		try std.testing.expectEqual(err_dimensions_too_large, status);
+		try std.testing.expectEqual(@as(f64, 123), output);
+	}
 }

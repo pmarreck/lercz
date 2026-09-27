@@ -7,6 +7,10 @@ packaged for Zig projects such as `tiffz`. It follows the `zstdz` pattern:
 build the original C++ codec with Zig and expose its C API through a thin Zig
 module, keeping upstream codec changes easy to import.
 
+The bundled codec is [LERC 4.2.0](https://github.com/Esri/lerc/releases/tag/v4.2.0).
+This release adds explicit size limits and overflow checks; oversized dimensions
+are reported through `lercz.err_dimensions_too_large`.
+
 LERC (Limited Error Raster Compression) compresses numerical raster data,
 including integer and floating-point pixels. Callers set a maximum error per
 pixel: zero gives lossless compression; a positive bound trades precision for
@@ -26,7 +30,8 @@ smaller output. Elevation maps and scientific imagery are typical uses.
   targets Linux x86_64/aarch64 and macOS aarch64; Linux packages use musl.
 - **Additional Zig tests:** checks for exported constants, C linkage through
   compressed-size calculation, and a byte-exact lossless encode/decode round
-  trip. These supplement the upstream samples and tests.
+  trip, plus oversized-dimension rejection. These supplement the upstream
+  samples and tests.
 - **Upstream-release gate:** the supported build command refuses outdated
   LERC source and refuses to build when it cannot verify the latest release.
   Offline tests cover its version comparison, error handling, and enforcement.
