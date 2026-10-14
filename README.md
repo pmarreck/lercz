@@ -39,6 +39,9 @@ smaller output. Elevation maps and scientific imagery are typical uses.
 For future contributors and agents, [INTENT.md](INTENT.md) records the fork's
 purpose, boundaries, and success criteria.
 
+[Fork maintenance](doc/FORK_MAINTENANCE.md) records how downstream finding
+policies and mutation-test terminology apply to this wrapper.
+
 ## Building and testing the fork
 
 Enter the pinned development environment, then use the checked build command:
