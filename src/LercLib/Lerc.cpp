@@ -466,8 +466,15 @@ ErrCode Lerc::DecodeTempl(T* pData, const Byte* pLercBlob, unsigned int numBytes
         if (bGetMask && !bitMask.SetSize(nCols, nRows))
           return ErrCode::Failed;
 
-        if (!lerc2.Decode(&pByte, nBytesRemaining, arr, bGetMask ? bitMask.Bits() : nullptr))
+        // A successful band must consume exactly its declared blob. In
+        // particular, the version field is outside the Lerc2 checksum;
+        // a changed version can otherwise decode a different header layout.
+        const Byte* pBandStart = pByte;
+        size_t nBandBytesRemaining = (size_t)hdInfo.blobSize;
+        if (!lerc2.Decode(&pByte, nBandBytesRemaining, arr, bGetMask ? bitMask.Bits() : nullptr)
+          || nBandBytesRemaining != 0 || (size_t)(pByte - pBandStart) != (size_t)hdInfo.blobSize)
           return ErrCode::Failed;
+        nBytesRemaining -= (size_t)hdInfo.blobSize;
 
         if (lercInfo.nUsesNoDataValue && nDepth > 1)
         {
@@ -481,6 +488,8 @@ ErrCode Lerc::DecodeTempl(T* pData, const Byte* pLercBlob, unsigned int numBytes
         if (bGetMask && !Convert(bitMask, pValidBytes + nPix))
           return ErrCode::Failed;
       }
+      else
+        return ErrCode::Failed;
     }  // iBand
   }  // Lerc2
 

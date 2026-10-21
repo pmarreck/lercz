@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -u
+cli=${1:?pass the exact CLI executable}
+work=$(mktemp -d) || exit 1
+trap 'rm -rf -- "$work"' EXIT
+failures=0
+checks=0
+run() {
+	local expected=$1; shift
+	"$@" >"$work/out" 2>"$work/err"; local status=$?
+	checks=$((checks+1))
+	if [[ $status != "$expected" ]]; then
+		printf 'FAIL: expected %s, got %s: %s\n' "$expected" "$status" "$*" >&2
+		cat "$work/err" >&2; failures=$((failures+1))
+	fi
+}
+assert() { checks=$((checks+1)); if ! "$@" >"$work/assert-out" 2>"$work/assert-err"; then printf 'FAIL: %s\n' "$*" >&2; failures=$((failures+1)); fi; }
+if [[ ! -x $cli ]]; then printf 'FAIL: C CLI executable missing: %s\n' "$cli" >&2; exit 1; fi
+run 0 "$cli" --help
+assert grep -q encode "$work/out"
+run 0 "$cli" --ascii --help
+# A bare assignment is not exported, so grep would stay in the UTF-8
+# locale, where this range also matches ordinary letters.
+assert bash -c 'export LC_ALL=C; ! grep -q "[^ -~]" "$1"' _ "$work/out"
+run 0 "$cli" --about
+assert grep -Eq 'lercz .*4\.2\.0.*(linux|macos|windows).*(x86_64|aarch64)' "$work/out"
+assert test "$(wc -l <"$work/out")" -eq 1
+run 2 "$cli" --unknown
+run 2 "$cli" encode --width 0 --height 1 --type u8
+run 2 "$cli" encode --width -1 --height 1 --type u8
+run 2 "$cli" encode --width 1 --height 1 --type u8 --error nan
+printf '\000\001\177\377' >"$work/pixels ü.raw"
+run 0 "$cli" encode --width 2 --height 2 --type u8 -o "$work/tile.lerc" "$work/pixels ü.raw"
+assert test -s "$work/tile.lerc"
+assert test ! -s "$work/out"
+run 0 "$cli" info --json "$work/tile.lerc"
+assert jq -e '.width == 2 and .height == 2 and .type == "u8" and .bands == 1 and .depth == 1' "$work/out"
+run 0 "$cli" decode "$work/tile.lerc"
+assert cmp "$work/pixels ü.raw" "$work/out"
+run 0 "$cli" decode @stdin -o @stdout <"$work/tile.lerc"
+assert cmp "$work/pixels ü.raw" "$work/out"
+run 0 "$cli" check - --json <"$work/tile.lerc"
+assert jq -e '.ok == true and .decoded == true' "$work/out"
+run 0 "$cli" decode --json "$work/tile.lerc"
+assert jq -e '.values == [0,1,127,255]' "$work/out"
+printf '[0,1,127,255]' >"$work/pixels.json"
+run 0 "$cli" encode --json-input --width 2 --height 2 --type u8 "$work/pixels.json" -o "$work/json.lerc"
+run 0 "$cli" decode "$work/json.lerc"
+assert cmp "$work/pixels ü.raw" "$work/out"
+for bad in '[0,1,127,256]' '[0,1,127,1.5]' '[0,1,127,01]' '[0,1,127,255,]' '[0,1,127]' '[0,1,127,255]garbage'; do
+	printf '%s' "$bad" >"$work/bad.json"
+	run 2 "$cli" encode --json-input --width 2 --height 2 --type u8 "$work/bad.json"
+done
+run 3 "$cli" decode --max-bytes 1 --json-errors "$work/tile.lerc"
+assert jq -e '.category == "limit"' "$work/err"
+dd if=/dev/zero of="$work/zeros" bs=4096 count=1 2>"$work/dd-err"
+run 0 "$cli" encode --type u8 --width 64 --height 64 "$work/zeros" -o "$work/constant.lerc"
+run 3 "$cli" check --json-errors --max-bytes 1024 "$work/constant.lerc"
+assert jq -e '.category=="limit" and .stage=="decode" and .code=="ResourceLimit"' "$work/err"
+printf '[0,1,127,255]\000ignored' >"$work/nul.json"
+run 2 "$cli" encode --json-input --type u8 --width 2 --height 2 "$work/nul.json"
+printf 'bad' >"$work/bad.lerc"
+printf 'keep me' >"$work/keep"
+run 1 "$cli" decode --json-errors "$work/bad.lerc" -o "$work/keep"
+assert jq -e '.category == "codec" or .category == "format"' "$work/err"
+assert test "$(cat "$work/keep")" = 'keep me'
+assert test ! -s "$work/out"
+head -c 10 "$work/tile.lerc" >"$work/truncated"
+run 1 "$cli" check "$work/truncated"
+cat "$work/tile.lerc" >"$work/trailing"
+printf x >>"$work/trailing"
+run 1 "$cli" check "$work/trailing"
+run 1 "$cli" check --json-errors "$work/trailing"
+assert jq -e --argjson size "$(wc -c <"$work/tile.lerc")" '.schema=="lercz.error.v1" and .code=="TrailingData" and .offset==$size and .offset_is_exact and .length==1' "$work/err"
+run 1 "$cli" check --json-errors "$work/bad.lerc"
+assert jq -e '.code=="LercFailed" and .offset==null and .offset_is_exact==false and .block_offset==null and .blob_offset==0 and .stage=="metadata"' "$work/err"
+# Named options are order independent; later values win.
+run 0 "$cli" --width 3 encode --height 2 --type u8 --width 2 "$work/pixels ü.raw"
+assert cmp "$work/tile.lerc" "$work/out"
+cp "$work/tile.lerc" "$work/-dash"
+run 0 "$cli" check -- "$work/-dash"
+# Masked data is preserved semantically; invalid sample values are unspecified.
+printf '\001\000\001\001' >"$work/mask"
+run 0 "$cli" encode --width 2 --height 2 --type u8 --mask "$work/mask" "$work/pixels ü.raw" -o "$work/masked"
+run 0 "$cli" decode --mask "$work/decoded-mask" "$work/masked"
+assert cmp "$work/mask" "$work/decoded-mask"
+# Every public scalar type, signed boundaries and floating-point losslessness.
+for pair in 'i8:[-128,-1,0,127]' 'u8:[0,1,127,255]' 'i16:[-32768,-1,0,32767]' 'u16:[0,1,32768,65535]' 'i32:[-2147483648,-1,0,2147483647]' 'u32:[0,1,2147483648,4294967295]' 'f32:[-1.5,0,0.25,65536]' 'f64:[-1.5,0,0.25,1e100]'; do
+	type=${pair%%:*}; values=${pair#*:}
+	printf '%s' "$values" >"$work/values"
+	run 0 "$cli" encode --json-input --type "$type" --width 2 --height 2 "$work/values" -o "$work/typed"
+	run 0 "$cli" decode --json "$work/typed"
+	assert jq -e --argjson expected "$values" '.values == $expected' "$work/out"
+done
+run 0 "$cli" --ascii --no-progress --no-color check "$work/tile.lerc"
+assert test ! -s "$work/err"
+printf '[1e-310,-1e-310,5e-324,-5e-324]' >"$work/subnormal.json"
+run 0 "$cli" encode --type f64 --width 2 --height 2 --json-input "$work/subnormal.json" -o "$work/subnormal.lerc"
+run 0 "$cli" decode --json "$work/subnormal.lerc"
+# Coerce jq's arbitrary-precision literals to binary64, the declared sample type.
+assert jq -e '(.values|map(.+0))==([1e-310,-1e-310,5e-324,-5e-324]|map(.+0))' "$work/out"
+printf '[1,-9999,3,4,5,6,-9999,8]' >"$work/nodata.json"
+run 0 "$cli" encode --type f64 --width 2 --height 1 --depth 2 --bands 2 --nodata -9999 --json-input "$work/nodata.json" -o "$work/nodata.lerc"
+run 0 "$cli" decode --json "$work/nodata.lerc"
+assert jq -e '.values==[1,-9999,3,4,5,6,-9999,8] and .nodata==[-9999,-9999] and .mask==[1,1,1,1]' "$work/out"
+printf '[0.125,1.25,3.1,-0.3]' >"$work/lossy.json"
+run 0 "$cli" encode --type f64 --width 2 --height 2 --error 0.01 --json-input "$work/lossy.json" -o "$work/lossy.lerc"
+run 0 "$cli" decode --json "$work/lossy.lerc"
+assert jq -e '[.values,[0.125,1.25,3.1,-0.3]]|transpose|all(.[]; (.[0]-.[1]|fabs)<=0.01000000001)' "$work/out"
+if [[ -n ${2-} ]]; then
+	run 0 "$2" version-regression unused
+	run 0 "$2" old-versions unused
+	run 0 "$2" encode "$work/reference.lerc"
+	run 0 "$cli" decode --json "$work/reference.lerc"
+	assert jq -e '.values==[-1.5,0,0.25,65536]' "$work/out"
+	printf '[-1.5,0,0.25,65536]' >"$work/reference.json"
+	run 0 "$cli" encode --type f64 --width 2 --height 2 --json-input "$work/reference.json" -o "$work/cli.lerc"
+	run 0 "$2" decode "$work/cli.lerc"
+fi
+printf 'CLI: %s checks, %s failures\n' "$checks" "$failures"
+[[ $failures == 0 ]]

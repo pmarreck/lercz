@@ -38,3 +38,9 @@ OtherLanguages/Python/lerc/*.so*
 /OtherLanguages/Python/build/
 /OtherLanguages/Python/dist/
 /OtherLanguages/Python/*.egg*
+
+/.corruption-coverage/
+/.nix-out/
+
+# session handoff docs (skill: handoff)
+HANDOFF*

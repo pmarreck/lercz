@@ -24,7 +24,11 @@ smaller output. Elevation maps and scientific imagery are typical uses.
   configurable. The package currently requires Zig 0.16.0 or newer.
 - **Thin Zig interface:** `src/lercz.zig` exposes the C API as `lercz.c.*` and
   adds data-type/error constants. Consumers retain control of allocation and
-  error handling. The codec remains upstream C++, including its exceptions.
+  error handling. The codec remains upstream C++, including its exceptions,
+  with two local decoder checks. A band must consume exactly its declared
+  blob, and uncompressed samples are copied by byte count. The Lerc2 version
+  field is outside the checksum; without those checks a flipped version can
+  decode as success with the wrong values, or trap on a misaligned load.
 - **Nix packaging:** `flake.nix` supplies Zig, a development shell, library
   packages, and build/test checks. `flake.lock` pins the inputs. The flake
   targets Linux x86_64/aarch64 and macOS aarch64; Linux packages use musl.
@@ -43,6 +47,17 @@ purpose, boundaries, and success criteria.
 policies and mutation-test terminology apply to this wrapper.
 
 ## Building and testing the fork
+
+The fork now includes a C CLI over the public LERC ABI. Build and publish it
+with `./build-cli`, or use `nix develop -c ./build-cli --backend=direct`.
+The executable is `bin/<os>/<arch>/lercz`. It supports `encode`, `decode`,
+`info`, and full-decode `check`, including stdin and JSON diagnostics.
+See [CLI usage and errors](doc/CLI.md).
+
+`./corruption-coverage known-good.lerc` measures detection using the pinned
+`corruption-reader` sniper/bolter/shotgun/nuke profiles, with replay records and
+simultaneous 95% confidence intervals. Human tables use `tsv-to-ansi-table`;
+JSON is available with `--format json`. See [coverage methodology](doc/CORRUPTION_COVERAGE.md).
 
 Enter the pinned development environment, then use the checked build command:
 

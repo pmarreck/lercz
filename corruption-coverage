@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Fixed-size, replayable sampling; no adaptive stopping or mutation reimplementation.
+set -u
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 2
+trials=1000
+seed=42
+seconds=10
+format=table
+output=
+cli=${LERCZ_CLI:-}
+cr=${CORRUPTION_READER:-corruption-reader}
+table=${TSV_TO_ANSI_TABLE:-tsv-to-ansi-table}
+profiles=()
+params=()
+files=()
+ascii=0
+help() {
+	cat <<'HELP'
+Usage: ./corruption-coverage [options] KNOWN-GOOD.lerc [...]
+Test the C CLI through stdin using corruption-reader consumer CLI v1.
+  --trials N                Fixed trials per file/profile (default 1000)
+  --seed N                  Replayable corruption-reader master seed (default 42)
+  --profile NAME            Repeat to select sniper/bolter/shotgun/nuke (default all)
+  --param PROFILE:KEY=JSON   Configure a named profile; passed to corruption-reader
+  --timeout SECONDS         Per decode deadline (default 10)
+  --output DIR              New evidence directory (must not already exist)
+  --format table|json|tsv    Summary representation (default table)
+  --json                    Alias for --format json
+  --cli PATH                Exact lercz executable; otherwise native bin/ entrypoint
+  --corruption-reader PATH  Exact corruption-reader executable
+  --simple, --ascii         ASCII table, no color
+  --help, --about            Help or version
+Outputs include source snapshots/hashes, tool identities, every case record,
+per-case diagnostics and both pointwise and simultaneous 95% exact binomial
+intervals (Clopper-Pearson; Bonferroni over file/profile comparisons).
+No minimum detection rate is assumed. Unchanged cases are excluded from the
+rate; crashes/timeouts/limits are never credited as detection and fail the run.
+The interval applies to random mutations of these fixed files, not all LERC data.
+Exit: 0 complete assessment; 1 invalid control/incomplete trial; 2 usage/tool error.
+HELP
+}
+error() { printf 'corruption-coverage: %s\n' "$*" >&2; exit 2; }
+while (($#)); do
+	case $1 in
+		-h|--help) help; exit 0;;
+		--about) printf 'lercz corruption-coverage 1: replayable decoder detection with simultaneous 95%% confidence intervals\n'; exit 0;;
+		--json) format=json; shift;;
+		--simple|--ascii) ascii=1;shift;;
+		--trials|--seed|--profile|--param|--timeout|--output|--format|--cli|--corruption-reader)
+			(($#>=2)) || error "$1 needs a value"
+			case $1 in
+				--trials) trials=$2;; --seed) seed=$2;; --profile) profiles+=("$2");;
+				--param) params+=("$2");; --timeout) seconds=$2;; --output) output=$2;;
+				--format) format=$2;; --cli) cli=$2;; --corruption-reader) cr=$2;;
+			esac;shift 2;;
+		--) shift;files+=("$@");break;;
+		-*) error "unknown option: $1";;
+		*) files+=("$1");shift;;
+	esac
+done
+[[ $trials =~ ^[1-9][0-9]*$ && ${#trials} -le 7 && $trials -le 1000000 ]] || error 'trials must be 1..1000000'
+[[ $seconds =~ ^[1-9][0-9]*$ && ${#seconds} -le 5 ]] || error 'timeout must be positive integer seconds'
+[[ $format == table || $format == json || $format == tsv ]] || error 'unknown format'
+((${#files[@]})) || error 'provide at least one known-good LERC blob'
+((${#profiles[@]})) || profiles=(sniper bolter shotgun nuke)
+for p in "${profiles[@]}"; do case $p in sniper|bolter|shotgun|nuke);; *) error "unsupported profile: $p";; esac; done
+for parameter in "${params[@]}"; do
+	[[ $parameter == *:*'='* ]] || error 'parameter must be PROFILE:KEY=JSON'
+	p=${parameter%%:*}; found=0
+	for selected in "${profiles[@]}"; do [[ $p == "$selected" ]] && found=1; done
+	[[ $found == 1 ]] || error "parameter names unselected profile: $p"
+done
+# Repeated profile options mean selection, not hidden extra statistical comparisons.
+unique=();for p in "${profiles[@]}"; do found=0;for q in "${unique[@]}";do [[ $p == "$q" ]] && found=1;done;[[ $found == 1 ]] || unique+=("$p");done
+profiles=("${unique[@]}")
+if [[ -z $cli ]]; then
+	os=$(uname -s);arch=$(uname -m)
+	case $os in Linux)os=linux;;Darwin)os=macos;;*)error 'pass --cli on this host';;esac
+	case $arch in arm64)arch=aarch64;;x86_64|aarch64);;*)error 'unsupported host architecture';;esac
+	cli="$root/bin/$os/$arch/lercz"
+fi
+for tool in "$cli" "$cr" jq timeout sha256sum;do command -v "$tool" >/dev/null || error "missing executable: $tool";done
+if [[ $format == table ]];then command -v "$table" >/dev/null || error "missing table renderer: $table (or use --format json/tsv)";fi
+if [[ -z $output ]];then
+	mkdir -p "$root/.corruption-coverage" || exit 2
+	output=$(mktemp -d "$root/.corruption-coverage/run.XXXXXXXX") || exit 2
+else mkdir -- "$output" || error 'evidence directory must be new';fi
+output=$(cd -- "$output" && pwd) || exit 2
+work=$(mktemp -d) || exit 2
+trap 'rm -rf -- "$work"' EXIT
+"$cli" --about >"$output/decoder.txt" 2>"$work/err" || error 'decoder identity unavailable'
+"$cr" --about >"$output/corruptor.txt" 2>"$work/err" || error 'corruptor identity unavailable'
+sha256sum "$(command -v "$cli")" "$(command -v "$cr")" >"$output/tools.sha256" || exit 2
+comparisons=$((${#files[@]}*${#profiles[@]}))
+: >"$output/results.jsonl"
+: >"$output/sources.jsonl"
+index=0
+# Gate every pristine control before ANY corrupt-input experiment.
+for source in "${files[@]}";do
+	[[ -f $source ]] || error "not a regular source: $source"
+	cp -- "$source" "$output/source-$index.lerc" || exit 2
+	snapshot="$output/source-$index.lerc"
+	cat -- "$snapshot" | timeout --kill-after=2 "$seconds" "$cli" --no-progress --json-errors check - >"$work/out" 2>"$output/control-$index.jsonl"
+	statuses=("${PIPESTATUS[@]}")
+	if [[ ${statuses[0]} != 0 || ${statuses[1]} != 0 ]];then printf 'Pristine control failed: %s; see %s\n' "$source" "$output/control-$index.jsonl" >&2;exit 1;fi
+	digest=$(sha256sum "$snapshot");digest=${digest%% *}
+	jq -nc --arg source "$source" --arg snapshot "source-$index.lerc" --arg sha256 "$digest" --argjson index "$index" '{index:$index,path:$source,snapshot:$snapshot,sha256:$sha256,control:"accepted"}' >>"$output/sources.jsonl" || exit 2
+	index=$((index+1))
+done
+index=0
+for source in "${files[@]}";do
+	for profile in "${profiles[@]}";do
+		dir="$output/f$index-$profile";mkdir "$dir" || exit 2
+		profile_args=()
+		for parameter in "${params[@]}";do [[ ${parameter%%:*} != "$profile" ]] || profile_args+=(--param "${parameter#*:}");done
+		"$cr" corrupt "$profile" "${profile_args[@]}" --master "$seed" --count "$trials" --emit tmp --null --tmp-dir "$work" --report "$dir/records.jsonl" "$output/source-$index.lerc" >"$work/paths" 2>"$dir/corruptor.stderr"
+		status=$?
+		if [[ $status != 0 && $status != 3 ]];then printf 'Corruptor failed; evidence: %s\n' "$dir" >&2;exit 2;fi
+		mapfile -d '' -t paths <"$work/paths"
+		if [[ ${#paths[@]} != "$trials" ]] || ! jq -se --argjson n "$trials" 'length==$n and all(.[];.report==1 and .emitted==true and (.status=="applied" or .status=="noop"))' "$dir/records.jsonl" >/dev/null;then error 'incomplete or invalid consumer CLI v1 batch';fi
+		: >"$dir/outcomes.jsonl"
+		item=0
+		while IFS= read -r record;do
+			path=${paths[$item]}
+			expected_path=$(jq -r '.path' <<<"$record") || exit 2
+			[[ $path == "$expected_path" && -f $path ]] || error 'batch path/report mismatch'
+			changed=true;cmp -s -- "$output/source-$index.lerc" "$path" && changed=false
+			noop=$(jq -r '.status=="noop"' <<<"$record") || exit 2
+			cat -- "$path" | timeout --kill-after=2 "$seconds" "$cli" --no-progress --json-errors check - >"$work/out" 2>"$dir/diagnostic-$item.jsonl"
+			statuses=("${PIPESTATUS[@]}");status=${statuses[1]}
+			outcome=error
+			case $status in
+				0) if [[ $changed == true ]];then outcome=accepted;elif [[ $noop == true ]];then outcome=noop;else outcome=unchanged;fi;;
+				1) category=$(jq -rs 'if length==1 then .[0].category else null end' "$dir/diagnostic-$item.jsonl")
+					if [[ $changed == true && $noop == false ]];then case $category in codec)outcome=codec_rejection;;format)outcome=framing_rejection;;esac;fi;;
+				3) outcome=limit;;
+				124) outcome=timeout;;
+				*) if ((status>=128));then outcome=crash;fi;;
+			esac
+			# A reported no-op must be unchanged and accepted; detect a broken harness.
+			if [[ $noop == true && ( $changed == true || $status != 0 ) ]];then outcome=error;fi
+			if [[ ${statuses[0]} != 0 && $status == 0 ]];then outcome=error;fi
+			jq -nc --argjson item "$item" --argjson status "$status" --argjson changed "$changed" --arg outcome "$outcome" '{item:$item,decoder_exit:$status,changed:$changed,outcome:$outcome}' >>"$dir/outcomes.jsonl" || exit 2
+			rm -- "$path" || exit 2
+			item=$((item+1))
+		done <"$dir/records.jsonl"
+		jq -s -L "$root/scripts" --arg source "$source" --arg profile "$profile" --argjson index "$index" --argjson comparisons "$comparisons" 'include "coverage-summary"; summarize($comparisons)+{source:$source,source_index:$index,profile:$profile}' "$dir/outcomes.jsonl" >>"$output/results.jsonl" || exit 2
+		printf 'Assessed file %s / %s (%s trials)\n' "$index" "$profile" "$trials" >&2
+	done
+	index=$((index+1))
+done
+jq -n --slurpfile results "$output/results.jsonl" --slurpfile sources "$output/sources.jsonl" --rawfile decoder "$output/decoder.txt" --rawfile corruptor "$output/corruptor.txt" --arg seed "$seed" --arg output "$output" --argjson comparisons "$comparisons" --argjson trials "$trials" '{schema:"lercz.coverage.v1",confidence:0.95,interval:"clopper-pearson",adjustment:"bonferroni",comparisons:$comparisons,trials_per_comparison:$trials,master_seed:$seed,decoder:$decoder,corruptor:$corruptor,evidence_directory:$output,sources:$sources,results:$results,complete:all($results[];.complete),scope:"random mutations of the fixed source files; pointwise and simultaneous intervals; no corpus-general claim"}' >"$output/summary.json" || exit 2
+jq -r 'def percent: .*10000|round/100|tostring;
+ ["File","Profile","Rejected","Changed","Rate %","95% CI (joint)","No-op"]|@tsv' <"$output/summary.json" >"$output/summary.tsv" || exit 2
+jq -r 'def percent: .*10000|round/100|tostring;
+ def lower: .*10000|floor/100|tostring; def upper: .*10000|ceil/100|tostring;
+ .results[]|[.source_index,.profile,.rejected,.changed,(if .rate==null then "n/a" else (.rate|percent) end),(if .simultaneous_ci95==null then "n/a" else ((.simultaneous_ci95.low|lower)+".."+(.simultaneous_ci95.high|upper)) end),(.noops+.unchanged)]|@tsv' "$output/summary.json" >>"$output/summary.tsv" || exit 2
+case $format in
+	json) cat "$output/summary.json";;
+	tsv) cat "$output/summary.tsv";;
+	table) table_args=(--widths 'auto,auto,8,8,7,17,5' --decimal-separator .);[[ $ascii == 0 ]] || table_args+=(--ascii --color never);"$table" "${table_args[@]}" <"$output/summary.tsv" || exit 2;;
+esac
+printf 'Evidence: %s\n' "$output" >&2
+jq -e '.complete' "$output/summary.json" >/dev/null || exit 1

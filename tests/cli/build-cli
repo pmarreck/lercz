@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -u
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+work=$(mktemp -d) || exit 1
+trap 'rm -rf -- "$work"' EXIT
+# Sandbox builds have no /usr/bin/env. Generated scripts must name bash directly.
+bash_exe=$(command -v bash)
+[[ -x $root/build-cli ]] || { echo 'FAIL: build-cli missing' >&2; exit 1; }
+mkdir -p "$work/project/scripts" "$work/tools"
+cp "$root/build-cli" "$work/project/"
+printf '#!%s\n' "$bash_exe" >"$work/project/scripts/check-upstream-release"
+cat >>"$work/project/scripts/check-upstream-release" <<'GATE'
+exit "${GATE_STATUS:-0}"
+GATE
+printf '#!%s\n' "$bash_exe" >"$work/tools/zig"
+cat >>"$work/tools/zig" <<'ZIG'
+[[ ${BUILD_STATUS:-0} == 0 ]] || exit "$BUILD_STATUS"
+while (($#)); do case $1 in --prefix)prefix=$2;shift;;esac;shift;done
+mkdir -p "$prefix/bin"
+suffix=;[[ $prefix != *-windows-* ]] || suffix=.exe
+printf '#!%s\nprintf built\n' "$(command -v bash)" >"$prefix/bin/lercz$suffix"
+chmod +x "$prefix/bin/lercz$suffix"
+ZIG
+printf '#!%s\n' "$bash_exe" >"$work/tools/file"
+cat >>"$work/tools/file" <<'FILE'
+printf '%s\n' "${HEADER:-ELF 64-bit LSB executable, x86-64, statically linked}"
+FILE
+chmod +x "$work/project/scripts/check-upstream-release" "$work/tools/zig" "$work/tools/file"
+export PATH="$work/tools:$PATH"
+"$work/project/build-cli" --backend=direct --target x86_64-linux-musl >"$work/out" 2>"$work/err" || { cat "$work/err" >&2;exit 1; }
+entry="$work/project/bin/linux/x86_64/lercz"
+[[ -L $entry && $($entry) == built ]] || exit 1
+before=$(readlink "$entry")
+BUILD_STATUS=9 "$work/project/build-cli" --backend=direct --target x86_64-linux-musl >"$work/out" 2>"$work/err";rc=$?
+[[ $rc == 9 && $(readlink "$entry") == "$before" && $($entry) == built ]] || exit 1
+GATE_STATUS=1 "$work/project/build-cli" --backend=direct --target x86_64-linux-musl >"$work/out" 2>"$work/err";rc=$?
+[[ $rc == 1 && $(readlink "$entry") == "$before" ]] || exit 1
+# Classify the whole target/header cross-product; no foreign header is accepted.
+targets=(x86_64-linux-musl aarch64-linux-musl aarch64-macos x86_64-windows-gnu aarch64-windows-gnu)
+headers=('ELF 64-bit LSB executable, x86-64, statically linked' 'ELF 64-bit LSB executable, ARM aarch64, statically linked' 'Mach-O 64-bit arm64 executable' 'PE32+ executable (console) x86-64, for MS Windows' 'PE32+ executable for MS Windows (console), ARM64, 7 sections')
+for i in 0 1 2 3 4;do
+	for j in 0 1 2 3 4;do
+		HEADER=${headers[$j]} "$work/project/build-cli" --backend=direct --target "${targets[$i]}" >"$work/out" 2>"$work/err";rc=$?
+		if [[ $i == "$j" ]];then [[ $rc == 0 ]] || exit 1;else [[ $rc != 0 ]] || exit 1;fi
+	done
+done
+# Building through ./run must not contaminate a binary stdout stream.
+cp "$root/run" "$work/project/run"
+printf '#!%s\nprintf '\''build chatter\n'\''\n' "$bash_exe" >"$work/project/build-cli"
+host_os=$(uname -s);host_arch=$(uname -m)
+case $host_os in Linux)host_os=linux;;Darwin)host_os=macos;;esac
+[[ $host_arch != arm64 ]] || host_arch=aarch64
+mkdir -p "$work/project/bin/$host_os/$host_arch"
+# Replace only a fixture symlink generated above.
+rm -f "$work/project/bin/$host_os/$host_arch/lercz"
+printf '#!%s\nprintf payload\n' "$bash_exe" >"$work/project/bin/$host_os/$host_arch/lercz"
+chmod +x "$work/project/build-cli" "$work/project/bin/$host_os/$host_arch/lercz"
+"$work/project/run" >"$work/out" 2>"$work/err" || exit 1
+[[ $(cat "$work/out") == payload ]] || { echo 'FAIL: build chatter contaminated CLI stdout' >&2;exit 1; }
+grep -q 'build chatter' "$work/err" || exit 1

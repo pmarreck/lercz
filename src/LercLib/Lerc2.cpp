@@ -2073,9 +2073,8 @@ bool Lerc2::ReadTile(const Byte** ppByte, size_t& nBytesRemainingInOut, T* data,
     if (bDiffEnc)
       return false;    // doesn't make sense, should not happen
 
-    const T* srcPtr = (const T*)ptr;
-    int cnt = 0;
-
+    // The encoder writes these bytes with memcpy. A valid blob is not
+    // aligned to T, and a typed load is undefined. ReleaseSafe traps on it.
     for (int i = i0; i < i1; i++)
     {
       int k = i * nCols + j0;
@@ -2087,14 +2086,13 @@ bool Lerc2::ReadTile(const Byte** ppByte, size_t& nBytesRemainingInOut, T* data,
           if (nBytesRemaining < sizeof(T))
             return false;
 
-          data[m] = *srcPtr++;
+          T val;
+          memcpy(&val, ptr, sizeof(T));
+          ptr += sizeof(T);
+          data[m] = val;
           nBytesRemaining -= sizeof(T);
-
-          cnt++;
         }
     }
-
-    ptr += cnt * sizeof(T);
   }
   else
   {

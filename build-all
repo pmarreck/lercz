@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -u
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 2
+failures=0
+for target in x86_64-linux-musl aarch64-linux-musl aarch64-macos x86_64-windows-gnu aarch64-windows-gnu;do
+	"$root/build-cli" --target "$target" "$@" || failures=$((failures+1))
+done
+exit "$failures"

@@ -4,5 +4,13 @@ set -u
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")" || exit 1
 failures=0
 bash tests/cli/upstream-release || failures=$((failures + 1))
-zig build test "$@" || failures=$((failures + 1))
+bash tests/unit/coverage || failures=$((failures + 1))
+bash tests/cli/build-cli || failures=$((failures + 1))
+prefix=$(mktemp -d) || exit 1
+trap 'rm -rf -- "$prefix"' EXIT
+if zig build test cli --prefix "$prefix" "$@"; then
+	bash tests/cli/coverage "$prefix/bin/lercz" || failures=$((failures + 1))
+else
+	failures=$((failures + 1))
+fi
 exit "$failures"

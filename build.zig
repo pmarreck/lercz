@@ -53,6 +53,26 @@ pub fn build(b: *std.Build) void {
 	lerc_lib.installHeader(b.path("src/LercLib/include/Lerc_types.h"), "Lerc_types.h");
 	b.installArtifact(lerc_lib);
 
+	const cli = b.addExecutable(.{
+		.name = "lercz",
+		.root_module = b.createModule(.{
+			.target = target,
+			.optimize = optimize,
+			.link_libc = true,
+			.link_libcpp = true,
+		}),
+	});
+	cli.root_module.addCSourceFiles(.{ .files = &.{"src/cli.c"}, .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+	cli.root_module.addIncludePath(b.path("src/LercLib/include"));
+	cli.root_module.linkLibrary(lerc_lib);
+	if (linkage == .static) cli.root_module.addCMacro("LERC_STATIC", "");
+	cli.root_module.addCMacro("LERCZ_DEBUG", if (optimize == .Debug) "1" else "0");
+	cli.root_module.addCMacro("LERCZ_TARGET", b.fmt("\"{s}/{s}\"", .{ @tagName(target.result.os.tag), @tagName(target.result.cpu.arch) }));
+	if (target.result.os.tag == .windows) cli.root_module.linkSystemLibrary("shell32", .{});
+	b.installArtifact(cli);
+	const cli_step = b.step("cli", "Build and install the C API dogfooding CLI");
+	cli_step.dependOn(&b.addInstallArtifact(cli, .{}).step);
+
 	const lerc_module = b.addModule("lercz", .{
 		.root_source_file = b.path("src/lercz.zig"),
 	});
@@ -80,6 +100,19 @@ pub fn build(b: *std.Build) void {
 	const run_smoke = b.addRunArtifact(smoke);
 	const test_step = b.step("test", "Run lercz Zig-side smoke tests");
 	test_step.dependOn(&run_smoke.step);
+	const reference = b.addExecutable(.{
+		.name = "lercz-c-reference",
+		.root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }),
+	});
+	reference.root_module.addCSourceFiles(.{ .files = &.{"tests/ffi/reference.c"}, .flags = &.{"-std=c11"} });
+	reference.root_module.addIncludePath(b.path("src/LercLib/include"));
+	reference.root_module.linkLibrary(lerc_lib);
+	if (linkage == .static) reference.root_module.addCMacro("LERC_STATIC", "");
+	const cli_tests = b.addSystemCommand(&.{"bash"});
+	cli_tests.addFileArg(b.path("tests/cli/codec"));
+	cli_tests.addArtifactArg(cli);
+	cli_tests.addArtifactArg(reference);
+	test_step.dependOn(&cli_tests.step);
 }
 
 const top_sources = [_][]const u8{

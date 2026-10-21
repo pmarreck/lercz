@@ -7,13 +7,22 @@ for consumers such as `tiffz`. It follows the `zstdz` wrapper pattern: compile
 the upstream implementation through Zig and expose its C ABI with a thin Zig
 module. Nix supplies the toolchain and reproducible package/test builds.
 
+A small C CLI exercises that same public C ABI for encoding, decoding, blob
+inspection, and full-decode checks. Its stdin interface supports reproducible
+corruption experiments using the external `corruption-reader` tool. See
+[the CLI contract](doc/CLI.md) and [coverage methodology](doc/CORRUPTION_COVERAGE.md).
+
 LERC serves numerical raster data whose precision matters. Callers choose a
 maximum error per pixel, including zero for lossless compression.
 
 ## Scope and constraints
 
-- Preserve the upstream codec and public C ABI; keep fork-specific changes
-  concentrated in packaging, the Zig interface, tests, and documentation.
+- Preserve the upstream codec and public C ABI, except two local decoder
+  checks: a decoded band must consume exactly its declared blob, and
+  uncompressed samples are copied by byte count. The Lerc2 version field sits
+  outside the checksum, so those checks close a wrong-output decode. Keep
+  other fork-specific changes concentrated in packaging, the Zig interface,
+  tests, and documentation.
 - Expose the C functions through `lercz.c` and provide Zig constants for the
   public data types and error codes. Allocation policy, error mapping, and TIFF
   container handling belong to consumers.
@@ -27,7 +36,7 @@ maximum error per pixel, including zero for lossless compression.
   Zig or Nix and fails if freshness cannot be verified. Raw build graphs and
   deterministic tests stay offline for sandboxed packaging, downstream
   dependencies, and maintenance. See README for the enforcement boundary.
-- A pure-Zig codec rewrite, standalone raster application, and changes to the
+- A pure-Zig codec rewrite, a raster editing application, and changes to the
   LERC format are outside this fork's purpose.
 
 ## Evidence of success
@@ -39,6 +48,11 @@ maximum error per pixel, including zero for lossless compression.
   a checker that rejects every build is incorrect.
 - Documentation distinguishes upstream LERC features from this fork's additions
   and names any build paths that cannot perform a live freshness check.
+- The C CLI uses the public header exclusively and interoperates with an
+  independent C caller. Clean controls pass before corrupt-input experiments.
+- Corruption coverage reports replayable trials and 95% confidence intervals,
+  including simultaneous bounds across its file/profile comparisons. Crashes,
+  limits, no-ops and accepted mutations cannot be passed off as detection.
 
 ## Decision sources
 

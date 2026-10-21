@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -u
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 2
+"$root/build-cli" >&2 || exit $?
+os=$(uname -s);arch=$(uname -m)
+case $os in Linux)os=linux;;Darwin)os=macos;;*)exit 2;;esac
+[[ $arch != arm64 ]] || arch=aarch64
+exec "$root/bin/$os/$arch/lercz" "$@"

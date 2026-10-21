@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -u
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+# Exact binomial references: boundary values follow alpha^(1/n), central values
+# are the Clopper-Pearson Beta quantiles, not values captured from this implementation.
+jq -n -L "$root/scripts" 'include "coverage-summary";
+ def near($a;$b): ($a-$b|fabs)<0.00000001;
+ [ci95(0;0)==null,
+  near(ci95(0;100).low;0),near(ci95(0;100).high;0.0362166926451764),
+  near(ci95(100;100).low;0.963783307354824),near(ci95(100;100).high;1),
+  near(ci95(50;100).low;0.398321129503301),near(ci95(50;100).high;0.601678870496699),
+  ((ci(4;20;0.10).low-0.071354|fabs)<0.000001),
+  ((ci(4;20;0.10).high-0.401029|fabs)<0.000001),
+  (ci(100;100;0.05/4).low < ci95(100;100).low),
+  ([range(0;11) as $k | ci95($k;10) | .low>=0 and .high<=1 and .low<=.high] | all)] | all' | jq -e '. == true' >/dev/null
+rc=$?; [[ $rc == 0 ]] || exit 1
+jq -n -L "$root/scripts" 'include "coverage-summary";
+ [{outcome:"codec_rejection",changed:true},{outcome:"framing_rejection",changed:true},
+ {outcome:"accepted",changed:true},{outcome:"crash",changed:true},
+ {outcome:"timeout",changed:true},{outcome:"limit",changed:true},
+ {outcome:"error",changed:true},{outcome:"noop",changed:false},{outcome:"unchanged",changed:false}]
+ | summarize(4) | .trials==9 and .changed==7 and .rejected==2 and .accepted==1 and
+ .codec_rejections==1 and .framing_rejections==1 and .crashes==1 and .timeouts==1 and
+ .limits==1 and .errors==1 and .noops==1 and .unchanged==1 and .complete==false' | jq -e '.==true' >/dev/null

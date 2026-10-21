@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -u
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+cli=${1:?CLI executable}
+cr=${CORRUPTION_READER:-corruption-reader}
+work=$(mktemp -d) || exit 1
+trap 'rm -rf -- "$work"' EXIT
+failures=0
+check() { if ! "$@" >"$work/assert-out" 2>"$work/assert-err"; then printf 'FAIL: %s\n' "$*" >&2; cat "$work/assert-err" >&2; failures=$((failures+1)); fi; }
+if [[ ! -x $root/corruption-coverage ]]; then printf 'FAIL: corruption-coverage missing\n' >&2; exit 1; fi
+# A deterministic 64 KiB high-entropy tile leaves room for the full nuke window.
+LC_ALL=C awk 'BEGIN { x=17; for(i=0;i<65536;i++){x=(1664525*x+1013904223)%4294967296; printf "%c",int(x/16777216)}}' >"$work/good.raw"
+"$cli" encode --type u8 --width 256 --height 256 "$work/good.raw" -o "$work/good.lerc" >"$work/out" 2>"$work/err" || exit 1
+"$root/corruption-coverage" --cli "$cli" --corruption-reader "$cr" --trials 3 --seed 42 --format json --output "$work/report" "$work/good.lerc" >"$work/summary" 2>"$work/err"
+rc=$?
+if [[ $rc != 0 ]]; then cat "$work/err" >&2; exit 1; fi
+check jq -e '.confidence==0.95 and .interval=="clopper-pearson" and .complete and (.results|length)==4 and all(.results[]; .trials==3 and .changed==3 and .rejected==3 and .ci95.low>0 and .ci95.high==1)' "$work/summary"
+check test -s "$work/report/f0-sniper/records.jsonl"
+jq -c 'select(.item==0)|.record' "$work/report/f0-sniper/records.jsonl" >"$work/replay.json"
+"$cr" apply --case "$work/replay.json" "$work/good.lerc" >"$work/replay" 2>"$work/replay-err"; check test "$?" -eq 0
+"$cli" check --json-errors - <"$work/replay" >"$work/check-out" 2>"$work/check-err"; check test "$?" -eq 1
+# A configured shotgun window cannot fit this tiny tile; no-op is not detection.
+printf '\001' >"$work/tiny.raw"
+"$cli" encode --type u8 --width 1 --height 1 "$work/tiny.raw" -o "$work/tiny.lerc" || exit 1
+"$root/corruption-coverage" --cli "$cli" --corruption-reader "$cr" --profile shotgun --param shotgun:window_bytes=4096 --trials 2 --format json --output "$work/noop" "$work/tiny.lerc" >"$work/noop-summary" 2>"$work/err"
+check test "$?" -eq 0
+check jq -e '.results[0] | .changed==0 and .noops==2 and .ci95==null and .rate==null' "$work/noop-summary"
+# Corrupt baselines must stop the campaign before a reject-everything decoder can score well.
+printf garbage >"$work/bad.lerc"
+"$root/corruption-coverage" --cli "$cli" --corruption-reader "$cr" --trials 1 --format json --output "$work/bad-report" "$work/bad.lerc" >"$work/out" 2>"$work/err"
+check test "$?" -ne 0
+# The human renderer receives a header and rows, not hand-drawn parallel data.
+# Sandbox builds have no /usr/bin/env, so name the running bash directly.
+bash_exe=$(command -v bash)
+printf '#!%s\ncat\n' "$bash_exe" >"$work/table"
+chmod +x "$work/table"
+TSV_TO_ANSI_TABLE="$work/table" "$root/corruption-coverage" --cli "$cli" --corruption-reader "$cr" --profile nuke --trials 1 --format table --output "$work/table-report" "$work/tiny.lerc" >"$work/table-out" 2>"$work/err"
+check test "$?" -eq 0
+check grep -q '95% CI' "$work/table-out"
+check grep -q nuke "$work/table-out"
+# Exercise outcome classification against a separate decoder process: limits,
+# crashes, deadlines and missing diagnostics must never inflate detection.
+printf '#!%s\n' "$bash_exe" >"$work/decoder"
+cat >>"$work/decoder" <<'DECODER'
+if [[ ${1-} == --about ]];then printf 'test decoder\n';exit 0;fi
+data=$(mktemp) || exit 2
+trap 'rm -f -- "$data"' EXIT
+cat >"$data"
+cmp -s "$CONTROL" "$data" && exit 0
+case $MODE in
+	limit) printf '{"category":"limit"}\n' >&2;exit 3;;
+	crash) exit 139;;
+	timeout) exit 124;;
+	error) exit 1;;
+	accepted) exit 0;;
+esac
+DECODER
+chmod +x "$work/decoder"
+for mode in limit crash timeout error accepted;do
+	CONTROL="$work/good.lerc" MODE="$mode" "$root/corruption-coverage" --cli "$work/decoder" --corruption-reader "$cr" --profile sniper --trials 1 --format json --output "$work/$mode" "$work/good.lerc" >"$work/$mode-summary" 2>"$work/err"
+	rc=$?;expected=1;[[ $mode != accepted ]] || expected=0
+	check test "$rc" -eq "$expected"
+	check jq -e '.results[0].rejected==0 and .results[0].changed==1' "$work/$mode-summary"
+	check jq -e --arg mode "$mode" '.[0].outcome==$mode' < <(jq -s '.' "$work/$mode/f0-sniper/outcomes.jsonl")
+done
+printf 'Coverage integration: %s failures\n' "$failures"
+[[ $failures == 0 ]]

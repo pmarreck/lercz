@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -u
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 2
+backend=nix
+profile=ReleaseFast
+target=
+check=0
+while (($#));do
+	case $1 in
+		-h|--help) printf 'Usage: ./build-cli [--backend=nix|direct] [--target TRIPLE] [--debug] [--test]\nLive upstream check, build library and C CLI, verify and publish bin/OS/ARCH/lercz.\n';exit 0;;
+		--backend=*)backend=${1#*=};;
+		--debug)profile=Debug;;
+		--test)check=1;;
+		--target) (($#>=2)) || exit 2;target=$2;shift;;
+		*)printf 'Unknown build option: %s\n' "$1" >&2;exit 2;;
+	esac;shift
+done
+[[ $backend == nix || $backend == direct ]] || exit 2
+if [[ -z $target ]];then
+	arch=$(uname -m);[[ $arch != arm64 ]] || arch=aarch64
+	case $(uname -s) in Linux)target="$arch-linux-musl";;Darwin)target="$arch-macos";;*)printf 'Specify --target on this host\n' >&2;exit 2;;esac
+fi
+suffix=
+case $target in
+	x86_64-linux-musl)os=linux;arch=x86_64;pattern='ELF 64-bit.*x86-64';;
+	aarch64-linux-musl)os=linux;arch=aarch64;pattern='ELF 64-bit.*aarch64';;
+	aarch64-macos)os=macos;arch=aarch64;pattern='Mach-O 64-bit arm64';;
+	x86_64-windows-gnu)os=windows;arch=x86_64;suffix=.exe;pattern='PE32\+.*x86-64';;
+	aarch64-windows-gnu)os=windows;arch=aarch64;suffix=.exe;pattern='PE32\+.*(Aarch64|ARM64)';;
+	*)printf 'Unsupported target: %s\n' "$target" >&2;exit 2;;
+esac
+cd -- "$root" || exit 2
+"$root/scripts/check-upstream-release" || exit $?
+if [[ $check == 1 ]];then bash "$root/test" || exit $?;fi
+if [[ $backend == direct ]];then
+	product="zig-out/$target/$profile"
+	[[ ! -L $product ]] || { printf 'Refusing a symlink as a writable build prefix\n' >&2;exit 2; }
+	zig build "-Dtarget=$target" "-Doptimize=$profile" --prefix "$product" || exit $?
+else
+	mkdir -p ".nix-out/$target" || exit 2
+	product=".nix-out/$target/$profile"
+	attribute=$target;[[ $profile != Debug ]] || attribute="$target-debug"
+	nix build ".#$attribute" --out-link "$product" || exit $?
+fi
+binary="$root/$product/bin/lercz$suffix"
+header=$(file -Lb "$binary") || exit 2
+if ! printf '%s\n' "$header" | grep -Eq "$pattern";then printf 'Wrong executable header: %s\n' "$header" >&2;exit 2;fi
+if [[ $os == linux ]] && ! printf '%s\n' "$header" | grep -q 'statically linked';then printf 'Expected a static musl executable\n' >&2;exit 2;fi
+entry="bin/$os/$arch"
+mkdir -p "$entry" || exit 2
+mkdir "$entry/.publish-lock" 2>/dev/null || { printf 'Another publication owns %s\n' "$entry" >&2;exit 2; }
+temp="$entry/.lercz-$$$suffix"
+trap 'rm -f -- "$temp"; rmdir "$entry/.publish-lock"' EXIT
+if [[ $os == windows ]];then cp -- "$binary" "$temp" || exit 2;else ln -s "../../../$product/bin/lercz" "$temp" || exit 2;fi
+mv -f -- "$temp" "$entry/lercz$suffix" || exit 2
+printf 'Published %s (%s)\n' "$entry/lercz$suffix" "$profile" >&2
