@@ -13,6 +13,7 @@
 pub const c = @cImport({
 	@cDefine("LERC_STATIC", "");
 	@cInclude("Lerc_c_api.h");
+	@cInclude("Lerc_stream.h");
 	// Lerc_types.h is C++-only (uses namespaces) — reachable in comments
 	// from Lerc_c_api.h but never included. The enum values are stable
 	// and re-exported below as Zig constants.

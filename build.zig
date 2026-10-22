@@ -43,6 +43,10 @@ pub fn build(b: *std.Build) void {
 		.language = .cpp,
 	});
 	lerc_lib.root_module.addCSourceFiles(.{
+		.files = &.{"src/stream_parser.c"},
+		.flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+	});
+	lerc_lib.root_module.addCSourceFiles(.{
 		.root = b.path("src/LercLib/Lerc1Decode"),
 		.files = &lerc1_sources,
 		.flags = &cxx_flags,
@@ -51,6 +55,7 @@ pub fn build(b: *std.Build) void {
 
 	lerc_lib.installHeader(b.path("src/LercLib/include/Lerc_c_api.h"), "Lerc_c_api.h");
 	lerc_lib.installHeader(b.path("src/LercLib/include/Lerc_types.h"), "Lerc_types.h");
+	lerc_lib.installHeader(b.path("src/LercLib/include/Lerc_stream.h"), "Lerc_stream.h");
 	b.installArtifact(lerc_lib);
 
 	const cli = b.addExecutable(.{
@@ -108,6 +113,19 @@ pub fn build(b: *std.Build) void {
 	reference.root_module.addIncludePath(b.path("src/LercLib/include"));
 	reference.root_module.linkLibrary(lerc_lib);
 	if (linkage == .static) reference.root_module.addCMacro("LERC_STATIC", "");
+	const stream_test = b.addExecutable(.{
+		.name = "lercz-stream-test",
+		.root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }),
+	});
+	stream_test.root_module.addCSourceFiles(.{
+		.files = &.{"tests/ffi/stream.c"},
+		.flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+	});
+	stream_test.root_module.addIncludePath(b.path("src/LercLib/include"));
+	stream_test.root_module.linkLibrary(lerc_lib);
+	if (linkage == .static) stream_test.root_module.addCMacro("LERC_STATIC", "");
+	const run_stream = b.addRunArtifact(stream_test);
+	test_step.dependOn(&run_stream.step);
 	const cli_tests = b.addSystemCommand(&.{"bash"});
 	cli_tests.addFileArg(b.path("tests/cli/codec"));
 	cli_tests.addArtifactArg(cli);

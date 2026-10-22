@@ -23,6 +23,11 @@ maximum error per pixel, including zero for lossless compression.
   outside the checksum, so those checks close a wrong-output decode. Keep
   other fork-specific changes concentrated in packaging, the Zig interface,
   tests, and documentation.
+- A separate forward-only validation parser may sit beside that blob decoder.
+  The blob decoder remains the oracle and its functions stay. The validation
+  parser reports byte offsets, stable codes, and categories, and it can drop
+  sample bytes while still parsing them. It does not replace the blob API and
+  it is not a pure-Zig codec.
 - Expose the C functions through `lercz.c` and provide Zig constants for the
   public data types and error codes. Allocation policy, error mapping, and TIFF
   container handling belong to consumers.
