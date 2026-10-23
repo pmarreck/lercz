@@ -14,3 +14,4 @@ Completed PLAN.md items retired by plan-retire, oldest retirement first.
 
 - [x] [C CLI and corruption detection] Finish the version-bit corruption regression: ReleaseSafe rejects the version-field mutation instead of trapping in ReadTile. (done 2026-10-21 15:14 EDT)
 - [x] [C CLI and corruption detection] Build a C CLI over the public LERC C ABI with encode, decode, check, info, standard stream/options, and regression tests. (done 2026-10-21 15:23 EDT)
+- [x] [C CLI and corruption detection] Add corruption-coverage using corruption-reader sniper/bolter/shotgun/nuke, clean controls, replayable cases, and 95% confidence intervals. (done 2026-10-21 15:23 EDT)

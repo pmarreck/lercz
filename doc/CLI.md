@@ -56,6 +56,18 @@ metadata without full decoding and must not be used as the corruption oracle.
 The CLI rejects trailing bytes after complete LERC blobs; this is an additional
 framing policy beyond upstream's permissive metadata API.
 
+`--stream` selects the forward-only Lerc2 parser in `Lerc_stream.h` for `check`
+and `decode`. The CLI pulls the input through that reader's callback. It does
+not call `lerc_decode` on this path. `check --stream` sets the discard option:
+payload bytes are parsed and then dropped, so the decoded-size cap does not
+apply. `decode --stream` writes the published raw samples, and the validity
+bytes when `--mask` is set. Those buffers are reserved at `--max-bytes` before
+the header is known, because the parser does not grow them. A byte past
+`--max-bytes` is a limit error, including one trailing byte that would be
+`TrailingData` if the cap were higher. `encode`, `info`, `decode --json`, and
+`--json-metadata` reject `--stream`. `check --stream --json` emits
+`{"ok":true,"decoded":true,"stream":true}`.
+
 Inputs default to stdin; `-` and `@stdin` also select it. Outputs default to
 stdout; `-` and `@stdout` select it. Paths with spaces and UTF-8 are supported;
 Windows arguments and paths use native wide-character adapters. Binary streams
@@ -82,7 +94,8 @@ invalid encoding requests), and 3 for resource/codec-size limits. Success means
 the operation completed, not that arbitrary file content is authentic.
 
 JSON stderr uses `schema: "lercz.error.v1"`. `code` and `detail` are stable static
-tokens. `category` separates `codec`, `format`, `limit`, `io`, and `usage`.
+tokens. `category` separates `codec`, `format`, `limit`, `io`, `usage`, and, for
+`--stream`, `unsupported`.
 `class` is `failure` for a rejected blob and null for operational errors. This
 interface has no downstream validator verdict taxonomy.
 
@@ -111,3 +124,17 @@ lengths are unknown. No offset is inferred from a generic codec failure.
 This shape was reconciled with validate's library finding conventions. The
 CLI's JSON schema is documented here; upstream's C ABI is unchanged, and TIFF
 consumers still own their own error mapping.
+
+A `--stream` finding uses the same record. `stage` is `stream`, `lerc_status`
+is null, and `blob_offset` is 0. `code` is the parser's stable name: `FileKey`,
+`Truncated`, `Version`, `Checksum`, `HeaderField`, `BlobExtent`, `Mask`,
+`Consumption`, `Unsupported`, `TrailingData`, `Reader`, or `Buffer`.
+`TrailingData` keeps the CLI name for trailing bytes. The record is the first
+finding. `offset` is set when the parser marks that offset exact. `length` is
+set only when the parser supplies a span; otherwise `length` is null. Format
+and codec findings keep `class` `failure` and exit 1. `unsupported` means an
+unimplemented payload mode, not a corrupt file: `class` is null, and the
+process still exits 1 because the operation did not finish. `Buffer` is
+category `limit` and exits 3. A reader fault is category `io` and exits 2. An
+input that exceeds `--max-bytes` stays `ResourceLimit` at stage `read` and is
+reported instead of the reader finding.

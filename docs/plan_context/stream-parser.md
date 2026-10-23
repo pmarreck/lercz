@@ -32,6 +32,14 @@ faults. Fletcher32 keeps the encoder's byte pairing and its reduction every
 
 Lerc1 is not part of this API. The format does not change.
 
+## CLI
+
+`lercz --stream` on `check` and `decode` calls `lerc_stream_parse`. `check`
+sets discard. `decode` publishes raw samples into a buffer capped by
+`--max-bytes`. The CLI reports the first finding through `lercz.error.v1`.
+`encode` and `info` reject the option. The flag's user contract is in
+`doc/CLI.md`.
+
 ## First slice
 
 Parsed now: Lerc2 headers for versions 2 through 6, the checksum, an empty

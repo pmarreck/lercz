@@ -1,6 +1,7 @@
 /* Command-line adapter. The codec is accessed exclusively through its public C ABI. */
 #define _POSIX_C_SOURCE 200809L
 #include "Lerc_c_api.h"
+#include "Lerc_stream.h"
 #include <errno.h>
 #include <float.h>
 #include <limits.h>
@@ -50,6 +51,7 @@ static const char help[] =
 	"  --json-errors          Emit errors as JSON on stderr\n"
 	"  --json-metadata        Emit completion metadata as JSON on stderr\n"
 	"  --max-bytes N          Limit each input/decoded allocation (default 268435456)\n"
+	"  --stream               check/decode: pull input through the forward-only parser\n"
 	"  --progress, --no-progress  Completion byte counts on stderr (default TTY only)\n"
 	"  --simple, --ascii      Plain ASCII presentation without color\n"
 	"  --no-color, --no-ansi  Disable color (also honors NO_COLOR)\n"
@@ -58,6 +60,9 @@ static const char help[] =
 	"Samples are row-major, depth interleaved, bands sequential. Mask size is\n"
 	"width*height (shared) or width*height*bands. Decode returns one mask per band.\n"
 	"Invalid pixel values are unspecified; preserve the mask/no-data metadata.\n"
+	"check --stream parses each band and discards samples. decode --stream writes raw\n"
+	"samples, reserving --max-bytes before the header is known. decode --json and\n"
+	"--json-metadata are unavailable with --stream.\n"
 	"Exit: 0 success; 1 rejected blob; 2 usage/I/O; 3 resource/codec-size limit.\n";
 
 typedef struct {
@@ -66,7 +71,7 @@ typedef struct {
 	double error, nodata;
 	size_t limit;
 	int have_type, have_nodata, json, json_input, json_errors, json_metadata;
-	int progress, color, ascii, help, about;
+	int progress, color, ascii, help, about, stream;
 } Options;
 typedef struct {
 	unsigned char *data;
@@ -78,7 +83,7 @@ static unsigned codec_status;
 static int have_codec_status;
 static const char *error_code, *stage = "arguments";
 static size_t input_bytes, error_offset, error_length;
-static int offset_known;
+static int offset_known, length_known;
 
 static int failure(int status, const char *category, const char *message) {
 	error_category = category;
@@ -267,6 +272,10 @@ static int parse(int argc, char **argv) {
 			opt.progress = 0;
 			continue;
 		}
+		if (!ended && !strcmp(a, "--stream")) {
+			opt.stream = 1;
+			continue;
+		}
 		if (!ended &&
 			((!strcmp(a, "-o")) || !strcmp(a, "--output") || !strcmp(a, "/o") || !strcmp(a, "-i") ||
 			 !strcmp(a, "--input") || !strcmp(a, "--mask") || !strcmp(a, "--type") ||
@@ -345,6 +354,12 @@ static int parse(int argc, char **argv) {
 		((!strcmp(opt.mask, opt.output)) ||
 		 (is_output_stream(opt.mask) && is_output_stream(opt.output))))
 		return failure(2, "usage", "pixels and mask need separate output destinations");
+	if (opt.stream && (encoding || !strcmp(opt.verb, "info")))
+		return failure(2, "usage", "--stream requires check or decode");
+	if (opt.stream && opt.json && !strcmp(opt.verb, "decode"))
+		return failure(2, "usage", "--json is unavailable with decode --stream");
+	if (opt.stream && opt.json_metadata)
+		return failure(2, "usage", "--json-metadata is unavailable with --stream");
 	return 0;
 }
 static void json_number(FILE *f, double x) {
@@ -529,7 +544,202 @@ static int write_raw(const char *path, const void *data, size_t n) {
 		bad = 1;
 	return bad ? failure(2, "io", "output write failed") : 0;
 }
+typedef struct {
+	FILE *file;
+	size_t delivered;
+	size_t limit;
+	int io_error;
+	int over_limit;
+} StreamIn;
+
+/* A request that would pass --max-bytes peeks one more byte. EOF at the cap is a
+ * short read. Another byte is a limit, including a trailing byte read_all would
+ * also reject before it could be reported as trailing. */
+static int stream_past_limit(StreamIn *in) {
+	int c = fgetc(in->file);
+	if (c == EOF) {
+		if (ferror(in->file)) {
+			in->io_error = 1;
+			return 1;
+		}
+		return 0;
+	}
+	in->over_limit = 1;
+	return 1;
+}
+static int stream_pull(void *ctx, unsigned char *dst, size_t n, size_t *n_out) {
+	StreamIn *in = ctx;
+	size_t want = n;
+	size_t room;
+	size_t got;
+	*n_out = 0;
+	if (in->io_error || in->over_limit)
+		return 1;
+	if (!n)
+		return 0;
+	if (in->delivered >= in->limit)
+		return stream_past_limit(in);
+	room = in->limit - in->delivered;
+	if (n > room)
+		n = room;
+	got = fread(dst, 1, n, in->file);
+	if (ferror(in->file)) {
+		in->io_error = 1;
+		return 1;
+	}
+	in->delivered += got;
+	*n_out = got;
+	if (got < n)
+		return 0;
+	if (want > room)
+		return stream_past_limit(in);
+	return 0;
+}
+static const char *stream_code_name(uint32_t code) {
+	static const char *names[] = {
+		NULL,		  "FileKey",	"Truncated", "Version",		 "Checksum", "HeaderField",
+		"BlobExtent", "Mask",		"Consumption", "Unsupported", "TrailingData", "Reader",
+		"Buffer",
+	};
+	if (code < 1 || code >= sizeof(names) / sizeof(*names))
+		return "InvalidBlobHeader";
+	return names[code];
+}
+static int stream_failure(const lerc_stream_finding *f) {
+	const char *category = "format";
+	const char *message = "forward-only parser stopped";
+	int status = 1;
+	if (f->category == LERC_STREAM_CAT_CODEC)
+		category = "codec";
+	else if (f->category == LERC_STREAM_CAT_LIMIT) {
+		category = "limit";
+		status = 3;
+	} else if (f->category == LERC_STREAM_CAT_IO) {
+		category = "io";
+		status = 2;
+	} else if (f->category == LERC_STREAM_CAT_UNSUPPORTED) {
+		category = "unsupported";
+		message = "payload mode is not implemented";
+	}
+	status = failure(status, category, message);
+	error_code = stream_code_name(f->code);
+	stage = "stream";
+	if (f->flags & LERC_STREAM_OFFSET_EXACT) {
+		offset_known = 1;
+		error_offset = (size_t)f->offset;
+	}
+	if (f->flags & LERC_STREAM_LENGTH_PRESENT) {
+		length_known = 1;
+		error_length = (size_t)f->length;
+	}
+	return status;
+}
+static int finish_output(FILE *f) {
+	if (!f)
+		return failure(2, "io", "cannot open output");
+	if (f == stdout) {
+		if (fflush(f))
+			return failure(2, "io", "output write failed");
+	} else if (fclose(f))
+		return failure(2, "io", "output write failed");
+	return 0;
+}
+/* decode --stream reserves the sample cap up front. The parser will not grow it,
+ * and the raster size is not known until the header has been pulled. */
+static int execute_stream(void) {
+	StreamIn in;
+	lerc_stream_reader reader;
+	lerc_stream_report report;
+	lerc_stream_finding findings[8];
+	unsigned char *samples = NULL;
+	unsigned char *mask = NULL;
+	lerc_status status;
+	int rc = 0;
+	int decode = !strcmp(opt.verb, "decode");
+	memset(&in, 0, sizeof(in));
+	stage = "read";
+	in.limit = opt.limit;
+	in.file = open_file(opt.input, 0);
+	if (!in.file)
+		return failure(2, "io", "cannot open input");
+	if (decode) {
+		samples = malloc(opt.limit ? opt.limit : 1);
+		if (!samples) {
+			rc = failure(3, "limit", "allocation failed");
+			goto done;
+		}
+		if (opt.mask) {
+			mask = malloc(opt.limit ? opt.limit : 1);
+			if (!mask) {
+				rc = failure(3, "limit", "allocation failed");
+				goto done;
+			}
+		}
+	}
+	memset(&report, 0, sizeof(report));
+	if (!decode)
+		report.options = LERC_STREAM_DISCARD;
+	report.samples = samples;
+	report.sample_capacity = samples ? opt.limit : 0;
+	report.mask = mask;
+	report.mask_capacity = mask ? opt.limit : 0;
+	report.findings = findings;
+	report.findings_capacity = (uint32_t)(sizeof(findings) / sizeof(findings[0]));
+	reader.read = stream_pull;
+	reader.ctx = &in;
+	stage = "stream";
+	status = lerc_stream_parse(&reader, &report);
+	if (in.over_limit) {
+		stage = "read";
+		input_bytes = in.delivered;
+		rc = failure(3, "limit", "input exceeds --max-bytes");
+		goto done;
+	}
+	if (in.io_error) {
+		stage = "read";
+		input_bytes = in.delivered;
+		rc = failure(2, "io", "input read failed");
+		goto done;
+	}
+	input_bytes = (size_t)report.bytes_consumed;
+	if (status) {
+		rc = failure(2, "io", "stream parser refused the call");
+		goto done;
+	}
+	if (report.findings_count) {
+		rc = stream_failure(&findings[0]);
+		goto done;
+	}
+	if (decode) {
+		if ((rc = write_raw(opt.output, samples, report.sample_bytes)))
+			goto done;
+		if (opt.mask && (rc = write_raw(opt.mask, mask, report.mask_bytes)))
+			goto done;
+	} else if (opt.json) {
+		FILE *out = open_file(opt.output, 1);
+		if (!out) {
+			rc = failure(2, "io", "cannot open output");
+			goto done;
+		}
+		fputs("{\"ok\":true,\"decoded\":true,\"stream\":true}\n", out);
+		rc = finish_output(out);
+	} else
+		rc = finish_output(open_file(opt.output, 1));
+	if (rc)
+		goto done;
+	if (opt.progress == 1 || (opt.progress < 0 && isatty(fileno(stderr))))
+		fprintf(stderr, "%s: %zu input bytes, %zu sample bytes processed\n", opt.verb, input_bytes,
+				report.sample_bytes);
+done:
+	if (in.file && in.file != stdin && fclose(in.file) && !rc)
+		rc = failure(2, "io", "input close failed");
+	free(samples);
+	free(mask);
+	return rc;
+}
 static int execute(void) {
+	if (opt.stream)
+		return execute_stream();
 	Buffer input = {0}, mask = {0};
 	void *pixels = NULL;
 	unsigned char *encoded = NULL, *valid = NULL, *uses = NULL;
@@ -655,6 +865,7 @@ static int execute(void) {
 			if (info[7] < input.size) {
 				error_code = "TrailingData";
 				offset_known = 1;
+				length_known = 1;
 				error_offset = info[7];
 				error_length = input.size - info[7];
 			}
@@ -818,9 +1029,12 @@ static int cli_main(int argc, char **argv) {
 				fputs("null", stderr);
 			fprintf(stderr, ",\"offset_is_exact\":%s,\"block_offset\":null,\"blob_offset\":",
 					offset_known ? "true" : "false");
-			fputs(!strcmp(stage, "metadata") || !strcmp(stage, "decode") ? "0" : "null", stderr);
+			fputs(!strcmp(stage, "metadata") || !strcmp(stage, "decode") || !strcmp(stage, "stream")
+					  ? "0"
+					  : "null",
+				  stderr);
 			fputs(",\"length\":", stderr);
-			if (offset_known)
+			if (length_known)
 				fprintf(stderr, "%zu", error_length);
 			else
 				fputs("null", stderr);

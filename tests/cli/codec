@@ -18,6 +18,7 @@ assert() { checks=$((checks+1)); if ! "$@" >"$work/assert-out" 2>"$work/assert-e
 if [[ ! -x $cli ]]; then printf 'FAIL: C CLI executable missing: %s\n' "$cli" >&2; exit 1; fi
 run 0 "$cli" --help
 assert grep -q encode "$work/out"
+assert grep -Fq -- '--stream' "$work/out"
 run 0 "$cli" --ascii --help
 # A bare assignment is not exported, so grep would stay in the UTF-8
 # locale, where this range also matches ordinary letters.
@@ -117,5 +118,47 @@ if [[ -n ${2-} ]]; then
 	run 0 "$cli" encode --type f64 --width 2 --height 2 --json-input "$work/reference.json" -o "$work/cli.lerc"
 	run 0 "$2" decode "$work/cli.lerc"
 fi
+# --stream pulls through the forward-only parser. check discards samples.
+# decode publishes raw bytes. encode, info, and decode --json do not use it.
+run 2 "$cli" encode --stream --width 2 --height 2 --type u8 "$work/pixels ü.raw"
+run 2 "$cli" info --stream "$work/tile.lerc"
+run 2 "$cli" decode --stream --json "$work/tile.lerc"
+run 2 "$cli" check --stream --json-metadata "$work/tile.lerc"
+run 0 "$cli" check --stream --json "$work/tile.lerc"
+assert jq -e '.ok == true and .decoded == true and .stream == true' "$work/out"
+run 0 "$cli" --stream check --json - <"$work/tile.lerc"
+assert jq -e '.ok == true and .decoded == true and .stream == true' "$work/out"
+run 0 "$cli" decode --stream "$work/tile.lerc"
+assert cmp "$work/pixels ü.raw" "$work/out"
+run 0 "$cli" decode --stream --mask "$work/stream-mask" "$work/masked"
+assert cmp "$work/mask" "$work/stream-mask"
+printf 'keep me' >"$work/keep"
+run 1 "$cli" decode --stream --json-errors "$work/bad.lerc" -o "$work/keep"
+assert jq -e '.schema=="lercz.error.v1" and .code=="FileKey" and .category=="format" and .class=="failure" and .offset==0 and .length==1 and .offset_is_exact==true and .lerc_status==null and .stage=="stream" and .blob_offset==0' "$work/err"
+assert test "$(cat "$work/keep")" = 'keep me'
+run 1 "$cli" check --stream --json-errors "$work/trailing"
+assert jq -e --argjson size "$(wc -c <"$work/tile.lerc")" '.code=="TrailingData" and .category=="format" and .offset==$size and .length==1 and .offset_is_exact==true' "$work/err"
+cp "$work/tile.lerc" "$work/flipped"
+printf '\001' | dd of="$work/flipped" bs=1 seek=10 conv=notrunc status=none 2>"$work/dd-err"
+run 1 "$cli" check --stream --json-errors "$work/flipped"
+assert jq -e '.code=="Checksum" and .category=="codec" and .class=="failure" and .offset==10 and .length==4 and .offset_is_exact==true' "$work/err"
+printf 'keep me' >"$work/keep"
+run 1 "$cli" decode --stream "$work/flipped" -o "$work/keep"
+assert test "$(cat "$work/keep")" = 'keep me'
+run 0 "$cli" check --stream --max-bytes 1024 "$work/constant.lerc"
+assert test ! -s "$work/err"
+printf 'keep me' >"$work/keep"
+run 3 "$cli" decode --stream --json-errors --max-bytes 1024 "$work/constant.lerc" -o "$work/keep"
+assert jq -e '.category=="limit" and .code=="Buffer" and .class==null and .stage=="stream" and .lerc_status==null' "$work/err"
+assert test "$(cat "$work/keep")" = 'keep me'
+run 3 "$cli" check --stream --json-errors --max-bytes 1 "$work/tile.lerc"
+assert jq -e '.category=="limit" and .code=="ResourceLimit" and .stage=="read"' "$work/err"
+tile_size=$(wc -c <"$work/tile.lerc")
+tile_size=${tile_size//[[:space:]]/}
+run 3 "$cli" check --stream --json-errors --max-bytes "$tile_size" "$work/trailing"
+assert jq -e '.category=="limit" and .code=="ResourceLimit"' "$work/err"
+: >"$work/empty"
+run 1 "$cli" check --stream --json-errors "$work/empty"
+assert jq -e '.code=="Truncated" and .category=="format" and .offset_is_exact==true and .length>0' "$work/err"
 printf 'CLI: %s checks, %s failures\n' "$checks" "$failures"
 [[ $failures == 0 ]]
