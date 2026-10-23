@@ -79,6 +79,10 @@ typedef struct {
 	int has_unread;
 	unsigned char unread;
 	int publishing;
+	unsigned char *prev_bits;
+	size_t prev_bytes;
+	int prev_rows;
+	int prev_cols;
 } Cur;
 
 static void add_finding(Cur *c, uint64_t offset, uint64_t length, int with_length, uint32_t code, uint32_t category)
@@ -386,6 +390,29 @@ static void publish(Cur *c, const unsigned char *band, size_t n, int withhold)
 	r->sample_bytes += n;
 }
 
+static int bit_on(const unsigned char *bits, size_t k);
+
+static void publish_mask(Cur *c, const unsigned char *bits, int num_valid, int rows, int cols, int withhold)
+{
+	lerc_stream_report *r = c->report;
+	size_t n = (size_t)rows * (size_t)cols;
+	size_t i;
+	if (withhold || !c->publishing) {
+		c->publishing = 0;
+		return;
+	}
+	if ((r->options & LERC_STREAM_DISCARD) || !r->mask || n == 0)
+		return;
+	if (r->mask_bytes > SIZE_MAX - n || r->mask_bytes + n > r->mask_capacity) {
+		add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+		c->publishing = 0;
+		return;
+	}
+	for (i = 0; i < n; i++)
+		r->mask[r->mask_bytes + i] = (num_valid == 0 || (bits && !bit_on(bits, i))) ? 0 : 1;
+	r->mask_bytes += n;
+}
+
 static int band_too_big(int rows, int cols, int depth, int dt, uint64_t *where_kind)
 {
 	int es;
@@ -417,8 +444,60 @@ static int band_too_big(int rows, int cols, int depth, int dt, uint64_t *where_k
 	return 0;
 }
 
+static int bit_on(const unsigned char *bits, size_t k)
+{
+	return (bits[k >> 3] & (unsigned char)(0x80u >> (k & 7))) != 0;
+}
+
+static size_t count_valid(const unsigned char *bits, size_t npix)
+{
+	size_t i, n = 0;
+	if (!bits)
+		return npix;
+	for (i = 0; i < npix; i++)
+		if (bit_on(bits, i))
+			n++;
+	return n;
+}
+
+/* Expand LERC's byte run-length stream. Counts are little-endian int16.
+ * A positive count copies that many literals. A negative count repeats the
+ * next byte. The terminator is -32768. Success requires dst_n output bytes.
+ */
+static int rle_decode(const unsigned char *src, size_t n, unsigned char *dst, size_t dst_n, size_t *used)
+{
+	size_t i = 0;
+	size_t o = 0;
+	while (i + 2 <= n) {
+		int16_t cnt;
+		memcpy(&cnt, src + i, 2);
+		i += 2;
+		if (cnt == (int16_t)-32768) {
+			*used = i;
+			return o == dst_n;
+		}
+		if (cnt > 0) {
+			size_t lit = (size_t)cnt;
+			if (lit > n - i || o > dst_n || lit > dst_n - o)
+				return 0;
+			memcpy(dst + o, src + i, lit);
+			i += lit;
+			o += lit;
+		} else {
+			size_t rep = (size_t)(-(int)cnt);
+			if (i >= n || o > dst_n || rep > dst_n - o)
+				return 0;
+			if (rep)
+				memset(dst + o, src[i], rep);
+			i += 1;
+			o += rep;
+		}
+	}
+	return 0;
+}
+
 static int fill_const(int dt, int rows, int cols, int depth, int num_valid, double zmin, int per_depth,
-	const double *per_min, unsigned char *dst)
+	const double *per_min, const unsigned char *bits, unsigned char *dst)
 {
 	int es = elem_size(dt);
 	size_t pixel = (size_t)rows * (size_t)cols;
@@ -428,7 +507,10 @@ static int fill_const(int dt, int rows, int cols, int depth, int num_valid, doub
 		return 1;
 	for (i = 0; i < pixel; i++) {
 		int d;
-		unsigned char *pix = dst + i * (size_t)depth * (size_t)es;
+		unsigned char *pix;
+		if (bits && !bit_on(bits, i))
+			continue;
+		pix = dst + i * (size_t)depth * (size_t)es;
 		if (!per_depth) {
 			for (d = 0; d < depth; d++)
 				store_cast(dt, zmin, pix + (size_t)d * (size_t)es);
@@ -438,6 +520,23 @@ static int fill_const(int dt, int rows, int cols, int depth, int num_valid, doub
 		}
 	}
 	return 1;
+}
+
+static int scatter_valid(const unsigned char *bits, size_t npix, int depth, int es,
+	const unsigned char *raw, size_t raw_n, unsigned char *dst)
+{
+	size_t step = (size_t)depth * (size_t)es;
+	size_t k, used = 0;
+	memset(dst, 0, npix * step);
+	for (k = 0; k < npix; k++) {
+		if (bits && !bit_on(bits, k))
+			continue;
+		if (used > raw_n || step > raw_n - used)
+			return 0;
+		memcpy(dst + k * step, raw + used, step);
+		used += step;
+	}
+	return used == raw_n;
 }
 
 static int parse_band(Cur *c)
@@ -457,11 +556,13 @@ static int parse_band(Cur *c)
 	int es;
 	double zmin = 0, zmax = 0;
 	unsigned char *samples = NULL;
+	unsigned char *bits = NULL;
 	unsigned char *ranges = NULL;
 	double *dmin = NULL;
 	double *dmax = NULL;
 	size_t sample_bytes = 0;
 	int rc = 0;
+	int mask_ok = 0;
 
 	fletcher_init(&c->sum);
 	c->summing = 0;
@@ -636,34 +737,83 @@ static int parse_band(Cur *c)
 		int all_invalid = num_valid == 0;
 		if (!read_i32(c, &mask_bytes, band_end, 1, &mask_at))
 			return 0;
-		if (mask_bytes < 0 || ((all_valid || all_invalid) && mask_bytes != 0) ||
-			(!all_valid && !all_invalid && mask_bytes == 0)) {
+		if (mask_bytes < 0 || ((all_valid || all_invalid) && mask_bytes != 0)) {
 			add_finding(c, mask_at, 4, 1, LERC_STREAM_CODE_MASK, LERC_STREAM_CAT_FORMAT);
 			withhold = 1;
 			if (!drain(c, band_end))
 				return 0;
+		} else if (!all_valid && !all_invalid && mask_bytes == 0) {
+			size_t nbytes = ((size_t)rows * (size_t)cols + 7) >> 3;
+			if (!c->prev_bits || c->prev_rows != rows || c->prev_cols != cols || c->prev_bytes != nbytes) {
+				add_finding(c, mask_at, 4, 1, LERC_STREAM_CODE_MASK, LERC_STREAM_CAT_FORMAT);
+				withhold = 1;
+				if (!drain(c, band_end))
+					return 0;
+			} else {
+				bits = malloc(nbytes ? nbytes : 1);
+				if (!bits) {
+					add_finding(c, band_start, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+					withhold = 1;
+					if (!drain(c, band_end)) {
+						rc = 0;
+						goto done;
+					}
+				} else {
+					memcpy(bits, c->prev_bits, nbytes);
+					mask_ok = 1;
+				}
+			}
 		} else if (mask_bytes > 0) {
 			uint64_t room = c->pos <= band_end ? band_end - c->pos : 0;
-			add_finding(c, mask_at, 4, 1, LERC_STREAM_CODE_UNSUPPORTED, LERC_STREAM_CAT_UNSUPPORTED);
-			withhold = 1;
+			unsigned char *packed = NULL;
+			size_t npix = (size_t)rows * (size_t)cols;
+			size_t nbytes = (npix + 7) >> 3;
+			size_t used = 0;
 			if ((uint64_t)mask_bytes > room) {
 				add_finding(c, c->pos, room, 1, LERC_STREAM_CODE_TRUNCATED, LERC_STREAM_CAT_FORMAT);
 				c->stopped = 1;
 				return 0;
 			}
-			if (!drain(c, c->pos + (uint64_t)mask_bytes) || !drain(c, band_end))
-				return 0;
-		} else if (num_valid == 0 || zmin == zmax) {
+			packed = malloc((size_t)mask_bytes);
+			bits = calloc(1, nbytes ? nbytes : 1);
+			if (!packed || !bits) {
+				add_finding(c, band_start, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+				withhold = 1;
+				free(packed);
+				if (!drain(c, band_end)) {
+					rc = 0;
+					goto done;
+				}
+			} else if (!read_capped(c, packed, (size_t)mask_bytes, band_end, NULL)) {
+				free(packed);
+				rc = 0;
+				goto done;
+			} else if (!rle_decode(packed, (size_t)mask_bytes, bits, nbytes, &used)) {
+				free(packed);
+				add_finding(c, mask_at, 4, 1, LERC_STREAM_CODE_MASK, LERC_STREAM_CAT_FORMAT);
+				withhold = 1;
+				if (!drain(c, band_end)) {
+					rc = 0;
+					goto done;
+				}
+			} else {
+				free(packed);
+				mask_ok = 1;
+			}
+		} else {
+			mask_ok = 1;
+		}
+		if (!withhold && (num_valid == 0 || zmin == zmax)) {
 			if ((c->report->options & LERC_STREAM_DISCARD) == 0 && c->publishing) {
 				samples = calloc(1, sample_bytes ? sample_bytes : 1);
 				if (!samples) {
 					add_finding(c, band_start, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
 					withhold = 1;
 				} else {
-					fill_const(dt, rows, cols, depth, num_valid, zmin, 0, NULL, samples);
+					fill_const(dt, rows, cols, depth, num_valid, zmin, 0, NULL, bits, samples);
 				}
 			}
-		} else if (version >= 4) {
+		} else if (!withhold && version >= 4) {
 			size_t range_one = (size_t)depth * (size_t)es;
 			int equal = 1;
 			ranges = malloc(range_one * 2);
@@ -700,7 +850,7 @@ static int parse_band(Cur *c)
 							add_finding(c, band_start, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
 							withhold = 1;
 						} else {
-							fill_const(dt, rows, cols, depth, num_valid, zmin, 1, dmin, samples);
+							fill_const(dt, rows, cols, depth, num_valid, zmin, 1, dmin, bits, samples);
 						}
 					}
 				} else {
@@ -718,7 +868,9 @@ static int parse_band(Cur *c)
 						}
 					} else {
 						size_t raw_n = 0;
-						if (!mul_size((size_t)num_valid, (size_t)depth * (size_t)es, &raw_n) ||
+						size_t npix = (size_t)rows * (size_t)cols;
+						size_t valid_n = bits ? count_valid(bits, npix) : (size_t)num_valid;
+						if (!mul_size(valid_n, (size_t)depth * (size_t)es, &raw_n) ||
 							(uint64_t)raw_n > band_end - c->pos) {
 							add_finding(c, c->pos, band_end > c->pos ? band_end - c->pos : 0, 1,
 								LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
@@ -732,7 +884,7 @@ static int parse_band(Cur *c)
 								rc = 0;
 								goto done;
 							}
-						} else {
+						} else if (!bits) {
 							samples = calloc(1, sample_bytes ? sample_bytes : 1);
 							if (!samples) {
 								add_finding(c, band_start, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
@@ -745,11 +897,33 @@ static int parse_band(Cur *c)
 								rc = 0;
 								goto done;
 							}
+						} else {
+							unsigned char *raw = malloc(raw_n ? raw_n : 1);
+							samples = calloc(1, sample_bytes ? sample_bytes : 1);
+							if (!raw || !samples) {
+								free(raw);
+								add_finding(c, band_start, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+								withhold = 1;
+								if (!drain(c, band_end)) {
+									rc = 0;
+									goto done;
+								}
+							} else if (!read_capped(c, raw, raw_n, band_end, NULL)) {
+								free(raw);
+								rc = 0;
+								goto done;
+							} else if (!scatter_valid(bits, npix, depth, es, raw, raw_n, samples)) {
+								free(raw);
+								add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+								withhold = 1;
+							} else {
+								free(raw);
+							}
 						}
 					}
 				}
 			}
-		} else {
+		} else if (!withhold) {
 			add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_UNSUPPORTED, LERC_STREAM_CAT_UNSUPPORTED);
 			withhold = 1;
 			if (!drain(c, band_end))
@@ -777,11 +951,37 @@ static int parse_band(Cur *c)
 	}
 	if (c->report->findings_count + c->report->findings_omitted != mark)
 		withhold = 1;
+	if (!withhold && c->publishing && (c->report->options & LERC_STREAM_DISCARD) == 0 && c->report->mask) {
+		size_t n = (size_t)rows * (size_t)cols;
+		if (c->report->mask_bytes > SIZE_MAX - n || c->report->mask_bytes + n > c->report->mask_capacity) {
+			add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+			withhold = 1;
+		}
+	}
 	publish(c, samples, sample_bytes, withhold);
+	publish_mask(c, bits, num_valid, rows, cols, withhold);
+	if (mask_ok && rows > 0 && cols > 0) {
+		size_t nbytes = ((size_t)rows * (size_t)cols + 7) >> 3;
+		unsigned char *copy = malloc(nbytes ? nbytes : 1);
+		if (copy) {
+			if (bits)
+				memcpy(copy, bits, nbytes);
+			else if (num_valid == 0)
+				memset(copy, 0, nbytes);
+			else
+				memset(copy, 0xff, nbytes);
+			free(c->prev_bits);
+			c->prev_bits = copy;
+			c->prev_rows = rows;
+			c->prev_cols = cols;
+			c->prev_bytes = nbytes;
+		}
+	}
 	rc = 1;
 	(void)blobs_more;
 done:
 	free(samples);
+	free(bits);
 	free(ranges);
 	free(dmin);
 	free(dmax);
@@ -843,6 +1043,7 @@ lerc_status lerc_stream_parse(const lerc_stream_reader *reader, lerc_stream_repo
 	if (report->findings_capacity && !report->findings)
 		return 2;
 	report->sample_bytes = 0;
+	report->mask_bytes = 0;
 	report->findings_count = 0;
 	report->findings_omitted = 0;
 	report->bytes_consumed = 0;
@@ -867,6 +1068,7 @@ lerc_status lerc_stream_parse(const lerc_stream_reader *reader, lerc_stream_repo
 		if (!after_band(&cur, version, blobs_more))
 			break;
 	}
+	free(cur.prev_bits);
 	report->bytes_consumed = cur.pos;
 	report->stopped = (uint32_t)cur.stopped;
 	return 0;

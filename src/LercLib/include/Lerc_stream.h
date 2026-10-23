@@ -18,9 +18,12 @@ extern "C" {
  * Nonzero means the call itself was refused (null reader, or a sample
  * buffer missing when discard is off).
  *
- * Payload parsed in this slice: empty masks, constant bands, per-depth
- * constant ranges, and raw one-sweep samples. A stored mask, tiled
- * bit-stuffing, or Huffman coding is category unsupported, not corrupt.
+ * Payload parsed in this slice: empty masks, stored RLE masks, constant
+ * bands, per-depth constant ranges, and raw one-sweep samples. Tiled
+ * bit-stuffing or Huffman coding is category unsupported, not corrupt.
+ *
+ * When mask is non-NULL, each published band appends one byte per pixel,
+ * 1 for valid and 0 for invalid. A NULL mask is still parsed.
  */
 
 #define LERC_STREAM_DISCARD 1u
@@ -75,6 +78,9 @@ typedef struct lerc_stream_report {
 	uint32_t findings_omitted;
 	uint64_t bytes_consumed;
 	uint32_t stopped;
+	unsigned char *mask;
+	size_t mask_capacity;
+	size_t mask_bytes;
 } lerc_stream_report;
 
 /* Walk the reader and fill the out-fields of report. */

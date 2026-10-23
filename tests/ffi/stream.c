@@ -62,6 +62,54 @@ static int parse(const unsigned char *blob, unsigned n, size_t chunk, uint32_t o
 	return lerc_stream_parse(&reader, out) != 0;
 }
 
+static int encode_masked(const void *data, unsigned dt, int depth, int cols, int rows, int bands,
+	int nmasks, const unsigned char *mask, unsigned char *blob, unsigned cap, unsigned *n)
+{
+	if (lerc_computeCompressedSize(data, dt, depth, cols, rows, bands, nmasks, mask, 0, n))
+		return 1;
+	return lerc_encode(data, dt, depth, cols, rows, bands, nmasks, mask, 0, blob, cap, n) != 0;
+}
+
+static int parse_masked(const unsigned char *blob, unsigned n, size_t chunk, uint32_t options,
+	unsigned char *samples, size_t cap, unsigned char *mask, size_t mask_cap,
+	lerc_stream_finding *findings, uint32_t slots, lerc_stream_report *out)
+{
+	Chunk mem = {blob, n, 0, chunk};
+	lerc_stream_reader reader = {chunk_read, &mem};
+	memset(out, 0, sizeof(*out));
+	out->options = options;
+	out->samples = samples;
+	out->sample_capacity = cap;
+	out->mask = mask;
+	out->mask_capacity = mask_cap;
+	out->findings = findings;
+	out->findings_capacity = slots;
+	return lerc_stream_parse(&reader, out) != 0;
+}
+
+static void expect_masked(const char *name, const unsigned char *blob, unsigned n, size_t chunk,
+	const void *oracle, size_t nbytes, const unsigned char *mask, size_t npix)
+{
+	unsigned char got[1024];
+	unsigned char gmask[128];
+	lerc_stream_finding findings[8];
+	lerc_stream_report report;
+	memset(got, 0xA5, sizeof(got));
+	memset(gmask, 0xA5, sizeof(gmask));
+	if (parse_masked(blob, n, chunk, 0, got, sizeof(got), gmask, sizeof(gmask), findings, 8, &report)) {
+		fail(name);
+		return;
+	}
+	if (report.findings_count || report.findings_omitted || report.stopped || report.bytes_consumed != n ||
+		report.sample_bytes != nbytes || report.mask_bytes != npix ||
+		memcmp(got, oracle, nbytes) != 0 || memcmp(gmask, mask, npix) != 0) {
+		fprintf(stderr, "stream: %s mask count=%u stopped=%u consumed=%llu samples=%zu mask_bytes=%zu\n",
+			name, report.findings_count, report.stopped, (unsigned long long)report.bytes_consumed,
+			report.sample_bytes, report.mask_bytes);
+		fail(name);
+	}
+}
+
 static void expect_clean(const char *name, const unsigned char *blob, unsigned n, size_t chunk,
 	const void *oracle, size_t nbytes)
 {
@@ -364,6 +412,80 @@ static void test_version_mutation(void)
 	}
 }
 
+static void test_stored_mask(void)
+{
+	const double grid[16] = {
+		3, 3, 3, 3, 3, 3, 3, 3,
+		0, 0, 0, 0, 0, 0, 0, 0
+	};
+	const unsigned char grid_mask[16] = {
+		1, 1, 1, 1, 1, 1, 1, 1,
+		0, 0, 0, 0, 0, 0, 0, 0
+	};
+	const int sweep[4] = {0x12345678, 0, 0, -0x23456789};
+	const unsigned char sweep_mask[4] = {1, 0, 0, 1};
+	double d_oracle[16];
+	int i_oracle[4];
+	unsigned char m_oracle[16];
+	unsigned char blob[2048];
+	unsigned char kept[128];
+	unsigned n = 0;
+	lerc_stream_finding findings[8];
+	lerc_stream_report report;
+	if (encode_masked(grid, 7, 1, 8, 2, 1, 1, grid_mask, blob, sizeof(blob), &n) ||
+		lerc_decode(blob, n, 1, m_oracle, 1, 8, 2, 1, 7, d_oracle))
+		fail("mask const encode");
+	else {
+		unsigned char samples[256];
+		expect_masked("mask-const", blob, n, 1, d_oracle, sizeof(d_oracle), m_oracle, 16);
+		expect_masked("mask-const", blob, n, 5, d_oracle, sizeof(d_oracle), m_oracle, 16);
+		memset(samples, 0xA5, sizeof(samples));
+		memset(kept, 0xA5, sizeof(kept));
+		if (parse_masked(blob, n, 0, 0, samples, sizeof(samples), kept, 1, findings, 8, &report) ||
+			report.findings_count != 1 || findings[0].code != LERC_STREAM_CODE_BUFFER ||
+			findings[0].category != LERC_STREAM_CAT_LIMIT || report.sample_bytes || report.mask_bytes ||
+			samples[0] != 0xA5 || kept[0] != 0xA5)
+			fail("mask cap");
+		memset(kept, 0xA5, sizeof(kept));
+		if (parse_masked(blob, n, 3, LERC_STREAM_DISCARD, NULL, 0, kept, sizeof(kept), findings, 8, &report) ||
+			report.findings_count || report.bytes_consumed != n || report.sample_bytes || report.mask_bytes ||
+			kept[0] != 0xA5)
+			fail("mask discard");
+	}
+	{
+		double run_data[64];
+		unsigned char run_mask[64];
+		double run_oracle[64];
+		unsigned char run_m[64];
+		int pix;
+		for (pix = 0; pix < 64; pix++) {
+			run_mask[pix] = pix < 8 ? 1 : 0;
+			run_data[pix] = run_mask[pix] ? 4.0 : 0.0;
+		}
+		if (encode_masked(run_data, 7, 1, 8, 8, 1, 1, run_mask, blob, sizeof(blob), &n) ||
+			lerc_decode(blob, n, 1, run_m, 1, 8, 8, 1, 7, run_oracle))
+			fail("mask run encode");
+		else
+			expect_masked("mask-run", blob, n, 4, run_oracle, sizeof(run_oracle), run_m, 64);
+	}
+	{
+		const double bands[8] = {3, 0, 3, 0, 9, 0, 9, 0};
+		const unsigned char band_mask[4] = {1, 0, 1, 0};
+		double band_oracle[8];
+		unsigned char band_m[8];
+		if (encode_masked(bands, 7, 1, 2, 2, 2, 1, band_mask, blob, sizeof(blob), &n) ||
+			lerc_decode(blob, n, 2, band_m, 1, 2, 2, 2, 7, band_oracle))
+			fail("mask bands encode");
+		else
+			expect_masked("mask-bands", blob, n, 2, band_oracle, sizeof(band_oracle), band_m, 8);
+	}
+	if (encode_masked(sweep, 4, 1, 2, 2, 1, 1, sweep_mask, blob, sizeof(blob), &n) ||
+		lerc_decode(blob, n, 1, m_oracle, 1, 2, 2, 1, 4, i_oracle))
+		fail("mask sweep encode");
+	else
+		expect_masked("mask-sweep", blob, n, 3, i_oracle, sizeof(i_oracle), m_oracle, 4);
+}
+
 static void test_wrong_param(void)
 {
 	lerc_stream_report report;
@@ -383,6 +505,7 @@ int main(void)
 	test_wrong_param();
 	test_const_versions();
 	test_one_sweep();
+	test_stored_mask();
 	test_smooth_double_unsupported();
 	test_discard_and_bands();
 	test_truncation_checksum_fields();

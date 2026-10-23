@@ -35,6 +35,10 @@ Lerc1 is not part of this API. The format does not change.
 ## First slice
 
 Parsed now: Lerc2 headers for versions 2 through 6, the checksum, an empty
-mask, a constant band, per-depth constant ranges, and one raw one-sweep
-payload. A stored mask, tiled bit-stuffing, and Huffman are reported
-unsupported at the deciding byte. Those modes are still decoded by the oracle.
+mask, a stored RLE mask, a constant band, per-depth constant ranges, and
+one raw one-sweep payload. The mask is MSB-first bits, expanded with the
+byte RLE whose terminator is -32768. A later band may omit the mask
+and reuse the previous band's bits, which is what the encoder writes.
+Tiled bit-stuffing and Huffman are
+reported unsupported at the deciding byte. Those modes are still decoded
+by the oracle.
