@@ -35,10 +35,11 @@ Lerc1 is not part of this API. The format does not change.
 ## First slice
 
 Parsed now: Lerc2 headers for versions 2 through 6, the checksum, an empty
-mask, a stored RLE mask, a constant band, per-depth constant ranges, and
-one raw one-sweep payload. The mask is MSB-first bits, expanded with the
-byte RLE whose terminator is -32768. A later band may omit the mask
-and reuse the previous band's bits, which is what the encoder writes.
-Tiled bit-stuffing and Huffman are
-reported unsupported at the deciding byte. Those modes are still decoded
-by the oracle.
+mask, a stored RLE mask, a constant band, per-depth constant ranges, one
+raw one-sweep payload, and tiled bit-stuffing. The mask is MSB-first bits,
+expanded with the byte RLE whose terminator is -32768. A later band may
+omit the mask and reuse the previous band's bits, which is what the encoder
+writes. Tile bits are unpacked LSB-first inside each little-endian uint32,
+matching Lerc2 version 3 and later. A Huffman mode of 1, 2, or 3 is still
+reported unsupported at that byte. Mode 0 falls through to tiles. Those
+Huffman modes are still decoded by the oracle.

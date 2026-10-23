@@ -539,6 +539,475 @@ static int scatter_valid(const unsigned char *bits, size_t npix, int depth, int 
 	return used == raw_n;
 }
 
+/* Forward-only Lerc2 tiles. Bit fields are unpacked LSB-first inside each
+ * little-endian uint32, matching Lerc2 v3 and later. The spanning shift
+ * stays on uint32: a wider word would keep bits that shift drops.
+ */
+
+static unsigned int tail_unused(unsigned int n_elem, int num_bits)
+{
+	unsigned int bits_tail = (unsigned int)(((unsigned long long)n_elem * (unsigned int)num_bits) & 31u);
+	unsigned int bytes_tail = (bits_tail + 7u) >> 3;
+	return bytes_tail > 0 ? 4u - bytes_tail : 0u;
+}
+
+static int pull_uint(Cur *c, uint64_t band_end, int nb, unsigned int *out)
+{
+	unsigned char b[4];
+	if (nb != 1 && nb != 2 && nb != 4)
+		return 0;
+	if (!read_capped(c, b, (size_t)nb, band_end, NULL))
+		return -1;
+	if (nb == 1)
+		*out = b[0];
+	else if (nb == 2)
+		*out = (unsigned int)b[0] | ((unsigned int)b[1] << 8);
+	else {
+		unsigned int v;
+		memcpy(&v, b, 4);
+		*out = v;
+	}
+	return 1;
+}
+
+/* LSB-first unpack of one Lerc2 v3 bit field. num_bits is in 1..31. */
+static int unstuff_pull(Cur *c, uint64_t band_end, unsigned int *dst, unsigned int n_elem, int num_bits)
+{
+	unsigned long long nuints_ll;
+	size_t nuints, nbytes, used;
+	unsigned int tail;
+	unsigned char *raw = NULL;
+	unsigned int *words = NULL;
+	unsigned int *sp;
+	unsigned int i;
+	int bit_pos, nb;
+	if (n_elem == 0 || num_bits <= 0 || num_bits >= 32)
+		return 0;
+	nuints_ll = ((unsigned long long)n_elem * (unsigned int)num_bits + 31ull) / 32ull;
+	if (nuints_ll > SIZE_MAX / 4)
+		return 0;
+	nuints = (size_t)nuints_ll;
+	nbytes = nuints * 4;
+	tail = tail_unused(n_elem, num_bits);
+	if ((size_t)tail > nbytes)
+		return 0;
+	used = nbytes - tail;
+	raw = malloc(used ? used : 1);
+	words = calloc(nuints, 4);
+	if (!raw || !words) {
+		free(raw);
+		free(words);
+		return -2;
+	}
+	if (!read_capped(c, raw, used, band_end, NULL)) {
+		free(raw);
+		free(words);
+		return -1;
+	}
+	memcpy(words, raw, used);
+	free(raw);
+	bit_pos = 0;
+	nb = 32 - num_bits;
+	sp = words;
+	for (i = 0; i < n_elem; i++) {
+		if (nb - bit_pos >= 0) {
+			unsigned int w = *sp;
+			dst[i] = (w << (unsigned)(nb - bit_pos)) >> (unsigned)nb;
+			bit_pos += num_bits;
+			if (bit_pos == 32) {
+				sp++;
+				bit_pos = 0;
+			}
+		} else {
+			unsigned int v = (*sp++) >> (unsigned)bit_pos;
+			int sh = 64 - num_bits - bit_pos;
+			/* The 64 in the formula cancels to a shift of 1..31 on a uint32.
+			 * Widening the word would keep bits this shift is meant to drop.
+			 */
+			if (sh < 0 || sh >= 32) {
+				free(words);
+				return 0;
+			}
+			v |= ((*sp) << (unsigned)sh) >> (unsigned)nb;
+			dst[i] = v;
+			bit_pos -= nb;
+		}
+	}
+	free(words);
+	return 1;
+}
+
+/* BitStuffer2::Decode for version >= 3, including the LUT form.
+ * Returns 1, 0 with one consumption finding, -1 if the reader already
+ * recorded a fault, or -2 on allocation failure.
+ */
+static int bitstuff_pull(Cur *c, uint64_t band_end, unsigned int *dst, size_t max_count, size_t *n_out)
+{
+	unsigned char hdr = 0;
+	int bits67, nb, lut, num_bits, rc;
+	unsigned int n_elem = 0;
+	uint64_t hdr_at = 0, count_at;
+	if (!read_capped(c, &hdr, 1, band_end, &hdr_at))
+		return -1;
+	bits67 = hdr >> 6;
+	nb = bits67 == 0 ? 4 : 3 - bits67;
+	lut = (hdr >> 5) & 1;
+	num_bits = hdr & 31;
+	if (nb != 1 && nb != 2 && nb != 4) {
+		add_finding(c, hdr_at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+		return 0;
+	}
+	count_at = c->pos;
+	rc = pull_uint(c, band_end, nb, &n_elem);
+	if (rc != 1)
+		return rc;
+	if ((size_t)n_elem > max_count) {
+		add_finding(c, count_at, (uint64_t)nb, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+		return 0;
+	}
+	if (!lut) {
+		if (num_bits == 0) {
+			if (n_elem)
+				memset(dst, 0, (size_t)n_elem * sizeof(unsigned int));
+			*n_out = n_elem;
+			return 1;
+		}
+		rc = unstuff_pull(c, band_end, dst, n_elem, num_bits);
+		if (rc == 0)
+			add_finding(c, count_at, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+		if (rc == 1)
+			*n_out = n_elem;
+		return rc;
+	}
+	if (num_bits == 0) {
+		add_finding(c, count_at, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+		return 0;
+	}
+	{
+		unsigned char lut_n = 0;
+		unsigned int n_lut, i;
+		unsigned int *lutv = NULL;
+		int nbits = 0;
+		uint64_t lut_at;
+		if (!read_capped(c, &lut_n, 1, band_end, &lut_at))
+			return -1;
+		if (lut_n == 0) {
+			add_finding(c, lut_at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			return 0;
+		}
+		n_lut = (unsigned int)lut_n - 1u;
+		if (n_lut == 0) {
+			add_finding(c, lut_at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			return 0;
+		}
+		lutv = calloc((size_t)n_lut + 1u, sizeof(unsigned int));
+		if (!lutv)
+			return -2;
+		rc = unstuff_pull(c, band_end, lutv + 1, n_lut, num_bits);
+		if (rc != 1) {
+			free(lutv);
+			if (rc == 0)
+				add_finding(c, lut_at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			return rc;
+		}
+		while ((n_lut >> nbits) != 0)
+			nbits++;
+		if (nbits <= 0 || nbits >= 32) {
+			free(lutv);
+			add_finding(c, lut_at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			return 0;
+		}
+		rc = unstuff_pull(c, band_end, dst, n_elem, nbits);
+		if (rc != 1) {
+			free(lutv);
+			if (rc == 0)
+				add_finding(c, lut_at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			return rc;
+		}
+		for (i = 0; i < n_elem; i++) {
+			if (dst[i] > n_lut) {
+				free(lutv);
+				add_finding(c, lut_at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+				return 0;
+			}
+			dst[i] = lutv[dst[i]];
+		}
+		free(lutv);
+		*n_out = n_elem;
+		return 1;
+	}
+}
+
+static int dtype_used(int dt, int tc)
+{
+	int r = dt;
+	switch (dt) {
+	case 2:
+	case 4:
+		r = dt - tc;
+		break;
+	case 3:
+	case 5:
+		r = dt - 2 * tc;
+		break;
+	case 6:
+		if (tc == 0)
+			return 6;
+		return tc == 1 ? 2 : 1;
+	case 7:
+		if (tc == 0)
+			return 7;
+		r = dt - 2 * tc + 1;
+		break;
+	default:
+		return dt;
+	}
+	if (r < 0 || r > 7)
+		return -1;
+	return r;
+}
+
+static int pixel_on(const unsigned char *bits, int cols, int row, int col)
+{
+	if (!bits)
+		return 1;
+	return bit_on(bits, (size_t)row * (size_t)cols + (size_t)col);
+}
+
+static unsigned char *pix_at(unsigned char *img, int cols, int depth, int es, int row, int col, int idepth)
+{
+	size_t m = ((size_t)row * (size_t)cols + (size_t)col) * (size_t)depth + (size_t)idepth;
+	return img + m * (size_t)es;
+}
+
+static size_t tile_valid(const unsigned char *bits, int cols, int i0, int i1, int j0, int j1)
+{
+	int i, j;
+	size_t n = 0;
+	for (i = i0; i < i1; i++)
+		for (j = j0; j < j1; j++)
+			if (pixel_on(bits, cols, i, j))
+				n++;
+	return n;
+}
+
+static void store_clamped(int dt, double offset, unsigned int quant, double inv, double clamp, int diff,
+	const unsigned char *prev, unsigned char *dst)
+{
+	double z = offset + (double)quant * inv;
+	if (diff)
+		z += load_double(dt, prev);
+	if (z > clamp)
+		z = clamp;
+	store_cast(dt, z, dst);
+}
+
+/* One tile, one depth. img may be NULL when the pixels are dropped.
+ * Same return codes as bitstuff_pull. A 0 means one finding was added.
+ */
+static int read_one_tile(Cur *c, uint64_t band_end, int version, int cols, int depth, int dt,
+	int i0, int i1, int j0, int j1, int idepth, double zerr, double zmax, const double *dmax,
+	const unsigned char *bits, unsigned char *img)
+{
+	unsigned char flag = 0;
+	uint64_t at = 0;
+	int pattern, mode, bdiff, bits67, es, dt_used, rc;
+	int row, col;
+	size_t tw, th, npix, nq = 0;
+	double offset = 0, clamp, inv;
+	if (!read_capped(c, &flag, 1, band_end, &at))
+		return -1;
+	pattern = version >= 5 ? 14 : 15;
+	if (((flag >> 2) & pattern) != ((j0 >> 3) & pattern) || ((version >= 5) && (flag & 4) && idepth == 0)) {
+		add_finding(c, at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+		return 0;
+	}
+	bdiff = (version >= 5) && (flag & 4);
+	bits67 = flag >> 6;
+	mode = flag & 3;
+	es = elem_size(dt);
+	th = (size_t)(i1 - i0);
+	tw = (size_t)(j1 - j0);
+	npix = th * tw;
+	if (mode == 2) {
+		if (!img)
+			return 1;
+		for (row = i0; row < i1; row++) {
+			for (col = j0; col < j1; col++) {
+				unsigned char *dst;
+				if (!pixel_on(bits, cols, row, col))
+					continue;
+				dst = pix_at(img, cols, depth, es, row, col, idepth);
+				if (bdiff)
+					memcpy(dst, dst - es, (size_t)es);
+				else
+					store_cast(dt, 0, dst);
+			}
+		}
+		return 1;
+	}
+	if (mode == 0) {
+		if (bdiff) {
+			add_finding(c, at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			return 0;
+		}
+		for (row = i0; row < i1; row++) {
+			for (col = j0; col < j1; col++) {
+				unsigned char tmp[8];
+				if (!pixel_on(bits, cols, row, col))
+					continue;
+				if (!read_capped(c, tmp, (size_t)es, band_end, NULL))
+					return -1;
+				if (img)
+					memcpy(pix_at(img, cols, depth, es, row, col, idepth), tmp, (size_t)es);
+			}
+		}
+		return 1;
+	}
+	dt_used = dtype_used((bdiff && dt < 6) ? 4 : dt, bits67);
+	if (dt_used < 0 || elem_size(dt_used) <= 0) {
+		add_finding(c, at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+		return 0;
+	}
+	{
+		unsigned char raw[8];
+		int n = elem_size(dt_used);
+		if (!read_capped(c, raw, (size_t)n, band_end, NULL))
+			return -1;
+		offset = load_double(dt_used, raw);
+	}
+	clamp = (version >= 4 && depth > 1 && dmax) ? dmax[idepth] : zmax;
+	if (mode == 3) {
+		if (!img)
+			return 1;
+		for (row = i0; row < i1; row++) {
+			for (col = j0; col < j1; col++) {
+				unsigned char *dst;
+				if (!pixel_on(bits, cols, row, col))
+					continue;
+				dst = pix_at(img, cols, depth, es, row, col, idepth);
+				if (!bdiff)
+					store_cast(dt, offset, dst);
+				else {
+					double z = offset + load_double(dt, dst - es);
+					if (z > clamp)
+						z = clamp;
+					store_cast(dt, z, dst);
+				}
+			}
+		}
+		return 1;
+	}
+	{
+		unsigned int *quants = calloc(npix ? npix : 1, sizeof(unsigned int));
+		if (!quants)
+			return -2;
+		rc = bitstuff_pull(c, band_end, quants, npix, &nq);
+		if (rc != 1) {
+			free(quants);
+			return rc;
+		}
+		inv = 2 * zerr;
+		if (img) {
+			size_t q = 0;
+			int all = nq == npix;
+			if (!all && nq != tile_valid(bits, cols, i0, i1, j0, j1)) {
+				free(quants);
+				add_finding(c, at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+				return 0;
+			}
+			for (row = i0; row < i1; row++) {
+				for (col = j0; col < j1; col++) {
+					unsigned char *dst;
+					if (!all && !pixel_on(bits, cols, row, col))
+						continue;
+					dst = pix_at(img, cols, depth, es, row, col, idepth);
+					store_clamped(dt, offset, quants[q++], inv, clamp, bdiff, bdiff ? dst - es : dst, dst);
+				}
+			}
+		} else if (nq != npix && nq != tile_valid(bits, cols, i0, i1, j0, j1)) {
+			free(quants);
+			add_finding(c, at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			return 0;
+		}
+		free(quants);
+		return 1;
+	}
+}
+
+/* Walk the microblock grid. Stops at the first tile that does not decode. */
+static int read_tiles(Cur *c, uint64_t band_end, int version, int rows, int cols, int depth, int dt, int micro,
+	double zerr, double zmax, const double *dmax, const unsigned char *bits, unsigned char *img)
+{
+	int nvert = (int)(((long long)rows + micro - 1) / micro);
+	int nhori = (int)(((long long)cols + micro - 1) / micro);
+	int ti, tj, d;
+	for (ti = 0; ti < nvert; ti++) {
+		int i0 = (int)((long long)ti * micro);
+		long long i1ll = (long long)i0 + micro;
+		int i1 = i1ll > rows ? rows : (int)i1ll;
+		for (tj = 0; tj < nhori; tj++) {
+			int j0 = (int)((long long)tj * micro);
+			long long j1ll = (long long)j0 + micro;
+			int j1 = j1ll > cols ? cols : (int)j1ll;
+			for (d = 0; d < depth; d++) {
+				int rc = read_one_tile(c, band_end, version, cols, depth, dt, i0, i1, j0, j1, d,
+					zerr, zmax, dmax, bits, img);
+				if (rc != 1)
+					return rc;
+			}
+		}
+	}
+	return 1;
+}
+
+/* Flag byte 0. A following Huffman mode other than tiling stays unsupported.
+ * Returns 0 only when the walk must stop. *withhold is set when this band
+ * must not be published.
+ */
+static int decode_flag0(Cur *c, uint64_t band_end, int version, int rows, int cols, int depth, int dt, int micro,
+	double zerr, double zmax, const double *dmax, const unsigned char *bits, unsigned char **samples,
+	size_t sample_bytes, int *withhold)
+{
+	int huff = (version >= 2 && (dt == 0 || dt == 1) && zerr == 0.5) ||
+		(version >= 6 && (dt == 6 || dt == 7) && zerr == 0.0);
+	int rc;
+	unsigned char *img = NULL;
+	if (huff) {
+		unsigned char mode = 0;
+		uint64_t at = 0;
+		if (!read_capped(c, &mode, 1, band_end, &at))
+			return 0;
+		if (mode != 0) {
+			add_finding(c, at, 1, 1, LERC_STREAM_CODE_UNSUPPORTED, LERC_STREAM_CAT_UNSUPPORTED);
+			*withhold = 1;
+			return drain(c, band_end);
+		}
+	}
+	if (((c->report->options & LERC_STREAM_DISCARD) == 0 && c->publishing) || (version >= 5 && depth > 1)) {
+		img = calloc(1, sample_bytes ? sample_bytes : 1);
+		if (!img) {
+			add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+			*withhold = 1;
+			return drain(c, band_end);
+		}
+		*samples = img;
+	}
+	rc = read_tiles(c, band_end, version, rows, cols, depth, dt, micro, zerr, zmax, dmax, bits, img);
+	if (rc == -1)
+		return 0;
+	if (rc == -2) {
+		add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+		*withhold = 1;
+		return drain(c, band_end);
+	}
+	if (rc == 0) {
+		*withhold = 1;
+		return drain(c, band_end);
+	}
+	return 1;
+}
+
 static int parse_band(Cur *c)
 {
 	static const char key[] = "Lerc2 ";
@@ -554,7 +1023,7 @@ static int parse_band(Cur *c)
 	int fatal = 0;
 	int withhold = 0;
 	int es;
-	double zmin = 0, zmax = 0;
+	double zmin = 0, zmax = 0, zerr = 0;
 	unsigned char *samples = NULL;
 	unsigned char *bits = NULL;
 	unsigned char *ranges = NULL;
@@ -644,6 +1113,8 @@ static int parse_band(Cur *c)
 		if (!read_exact(c, raw, 8, NULL))
 			return 0;
 		memcpy(&v, raw, 8);
+		if (i == 0)
+			zerr = v;
 		if (i == 1)
 			zmin = v;
 		if (i == 2)
@@ -860,9 +1331,8 @@ static int parse_band(Cur *c)
 						goto done;
 					}
 					if (flag == 0) {
-						add_finding(c, at, 1, 1, LERC_STREAM_CODE_UNSUPPORTED, LERC_STREAM_CAT_UNSUPPORTED);
-						withhold = 1;
-						if (!drain(c, band_end)) {
+						if (!decode_flag0(c, band_end, version, rows, cols, depth, dt, micro,
+							zerr, zmax, dmax, bits, &samples, sample_bytes, &withhold)) {
 							rc = 0;
 							goto done;
 						}

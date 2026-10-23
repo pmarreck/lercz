@@ -203,36 +203,133 @@ static void test_one_sweep(void)
 	}
 }
 
-static void test_smooth_double_unsupported(void)
+static int tile_flag(const unsigned char *blob, unsigned n, int depth, int es, unsigned *at_out, unsigned *flag);
+
+static void test_integer_valued_doubles(void)
 {
+	/* Integer-valued floats are rewritten to maxZError 0.5 and tiled.
+	 * The byte after the zero flag is a tile comprFlag, not a Huffman mode.
+	 */
 	const double one[4] = {1, 2, 3, 4};
+	double oracle[4];
 	unsigned char blob[2048];
-	unsigned char samples[64];
+	unsigned char got[sizeof(oracle)];
 	unsigned n = 0;
-	/* v6 header, mask count, per-depth min/max, then the one-sweep flag. */
-	const uint64_t flag_at = 90 + 4 + 16;
+	unsigned at = 0, flag = 1;
+	int i;
+	lerc_stream_finding findings[8];
+	lerc_stream_report report;
+	if (encode_blob(one, -1, 7, 1, 2, 2, 1, blob, sizeof(blob), &n) ||
+		lerc_decode(blob, n, 0, NULL, 1, 2, 2, 1, 7, oracle) ||
+		tile_flag(blob, n, 1, (int)sizeof(double), &at, &flag) || flag != 0) {
+		fprintf(stderr, "stream: int-double fixture n=%u flag=%u\n", n, flag);
+		fail("int-double fixture");
+		return;
+	}
+	memset(got, 0xA5, sizeof(got));
+	if (parse(blob, n, 3, 0, got, sizeof(got), findings, 8, &report) ||
+		report.findings_count || report.findings_omitted || report.stopped ||
+		report.bytes_consumed != n || report.sample_bytes != sizeof(oracle) ||
+		memcmp(got, oracle, sizeof(oracle)) != 0) {
+		fprintf(stderr, "stream: int-double count=%u consumed=%llu samples=%zu code=%u\n",
+			report.findings_count, (unsigned long long)report.bytes_consumed,
+			report.sample_bytes, report.findings_count ? findings[0].code : 0);
+		for (i = 0; i < 4; i++) {
+			double g = 0;
+			memcpy(&g, got + (size_t)i * sizeof(double), sizeof(g));
+			fprintf(stderr, "stream: int-double [%d] oracle=%a got=%a\n", i, oracle[i], g);
+		}
+		fail("int-double");
+	}
+}
+
+/* Huffman-eligible bytes whose encoder still picked tiling (mode byte 0). */
+static void test_byte_tiles_mode0(void)
+{
+	enum { N = 8 };
+	unsigned char data[N * N];
+	unsigned char oracle[N * N];
+	unsigned char blob[2048];
+	unsigned n = 0, at = 0, flag = 1;
+	int i;
+	for (i = 0; i < N * N; i++)
+		data[i] = (unsigned char)(i % N);
+	if (encode_blob(data, -1, 1, 1, N, N, 1, blob, sizeof(blob), &n) ||
+		lerc_decode(blob, n, 0, NULL, 1, N, N, 1, 1, oracle) ||
+		tile_flag(blob, n, 1, 1, &at, &flag) || flag != 0 || at + 1 >= n || blob[at + 1] != 0) {
+		fprintf(stderr, "stream: byte-tile fixture n=%u flag=%u mode=%u\n", n, flag,
+			at + 1 < n ? blob[at + 1] : 0);
+		fail("byte-tile fixture");
+		return;
+	}
+	expect_clean("byte-tile", blob, n, 3, oracle, sizeof(oracle));
+}
+
+static void expect_huffman_unsupported(const char *name, const void *data, unsigned dt, int es,
+	int cols, int rows, unsigned mode)
+{
+	unsigned char blob[8192];
+	unsigned char samples[16];
+	unsigned n = 0, at = 0, flag = 1;
 	lerc_stream_finding findings[8];
 	lerc_stream_finding want[1];
 	lerc_stream_report report;
-	if (encode_blob(one, -1, 7, 1, 2, 2, 1, blob, sizeof(blob), &n) || n <= flag_at || blob[flag_at] != 0) {
-		fprintf(stderr, "stream: smooth fixture n=%u byte=%u\n", n,
-			n > flag_at ? blob[flag_at] : 0);
-		fail("smooth fixture");
+	if (encode_blob(data, -1, dt, 1, cols, rows, 1, blob, sizeof(blob), &n) ||
+		tile_flag(blob, n, 1, es, &at, &flag) || flag != 0 || at + 1 >= n || blob[at + 1] != mode) {
+		fprintf(stderr, "stream: %s fixture n=%u flag=%u mode=%u want=%u\n", name, n, flag,
+			at + 1 < n ? blob[at + 1] : 0, mode);
+		fail(name);
 		return;
 	}
 	memset(samples, 0xA5, sizeof(samples));
 	if (parse(blob, n, 3, 0, samples, sizeof(samples), findings, 8, &report))
-		fail("smooth call");
+		fail(name);
 	else {
 		memset(want, 0, sizeof(want));
-		want[0].offset = flag_at;
+		want[0].offset = (uint64_t)at + 1;
 		want[0].length = 1;
 		want[0].code = LERC_STREAM_CODE_UNSUPPORTED;
 		want[0].category = LERC_STREAM_CAT_UNSUPPORTED;
 		want[0].flags = LERC_STREAM_LENGTH_PRESENT;
-		expect_exact("smooth", &report, want, 1, 0, n);
+		expect_exact(name, &report, want, 1, 0, n);
 		if (report.sample_bytes || samples[0] != 0xA5)
-			fail("smooth samples");
+			fail(name);
+	}
+}
+
+/* Nonzero Huffman modes stay unsupported. The encoder picks the mode. */
+static void test_huffman_unsupported(void)
+{
+	enum { R = 8, T = 16, D = 48 };
+	unsigned char ramp[R * R];
+	unsigned char text[T * T];
+	double wave[D * D];
+	static const char phrase[] = "LERC huffman wins on smooth bytes.";
+	int i;
+	for (i = 0; i < R * R; i++)
+		ramp[i] = (unsigned char)(i & 255);
+	for (i = 0; i < T * T; i++)
+		text[i] = (unsigned char)phrase[i % (int)sizeof(phrase)];
+	for (i = 0; i < D * D; i++)
+		wave[i] = 0.25 * (double)(i % D) + 0.125;
+	expect_huffman_unsupported("huff-delta", ramp, 1, 1, R, R, 1);
+	expect_huffman_unsupported("huff-plain", text, 1, 1, T, T, 2);
+	expect_huffman_unsupported("huff-float", wave, 7, (int)sizeof(double), D, D, 3);
+	{
+		unsigned char blob[2048];
+		unsigned char samples[16];
+		unsigned n = 0;
+		lerc_stream_finding findings[4];
+		lerc_stream_report report;
+		if (encode_blob(ramp, -1, 1, 1, R, R, 1, blob, sizeof(blob), &n))
+			fail("huff-discard encode");
+		else {
+			memset(samples, 0xA5, sizeof(samples));
+			if (parse(blob, n, 3, LERC_STREAM_DISCARD, samples, sizeof(samples), findings, 4, &report) ||
+				report.findings_count != 1 || findings[0].code != LERC_STREAM_CODE_UNSUPPORTED ||
+				report.bytes_consumed != n || report.sample_bytes || samples[0] != 0xA5)
+				fail("huff-discard");
+		}
 	}
 }
 
@@ -486,6 +583,177 @@ static void test_stored_mask(void)
 		expect_masked("mask-sweep", blob, n, 3, i_oracle, sizeof(i_oracle), m_oracle, 4);
 }
 
+/* v6: 90-byte header, mask count, mask body, then per-depth min/max. */
+static int tile_flag(const unsigned char *blob, unsigned n, int depth, int es, unsigned *at_out, unsigned *flag)
+{
+	int mask_n;
+	unsigned at;
+	if (n < 98 || blob[6] != 6)
+		return -1;
+	memcpy(&mask_n, blob + 90, 4);
+	if (mask_n < 0)
+		return -1;
+	at = 94u + (unsigned)mask_n + (unsigned)depth * (unsigned)es * 2u;
+	if (at >= n)
+		return -1;
+	*at_out = at;
+	*flag = blob[at];
+	return 0;
+}
+
+static void test_tiled_ints(void)
+{
+	enum { N = 16 };
+	int data[N * N];
+	int oracle[N * N];
+	unsigned char blob[8192];
+	unsigned char got[N * N * sizeof(int)];
+	unsigned n = 0;
+	int i;
+	lerc_stream_finding findings[8];
+	lerc_stream_report report;
+	for (i = 0; i < N * N; i++)
+		data[i] = (i * 17) & 3;
+	if (encode_blob(data, -1, 4, 1, N, N, 1, blob, sizeof(blob), &n) ||
+		lerc_decode(blob, n, 0, NULL, 1, N, N, 1, 4, oracle) || n <= 102 || blob[6] != 6) {
+		fail("tile encode");
+		return;
+	}
+	if (blob[102] != 0) {
+		fprintf(stderr, "stream: tile fixture n=%u flag=%u\n", n, blob[102]);
+		fail("tile fixture");
+		return;
+	}
+	memset(got, 0xA5, sizeof(got));
+	if (parse(blob, n, 3, 0, got, sizeof(got), findings, 8, &report) ||
+		report.findings_count || report.findings_omitted || report.stopped ||
+		report.bytes_consumed != n || report.sample_bytes != sizeof(oracle) ||
+		memcmp(got, oracle, sizeof(oracle)) != 0) {
+		fprintf(stderr, "stream: tiled count=%u stopped=%u consumed=%llu samples=%zu code=%u off=%llu\n",
+			report.findings_count, report.stopped, (unsigned long long)report.bytes_consumed,
+			report.sample_bytes, report.findings_count ? findings[0].code : 0,
+			report.findings_count ? (unsigned long long)findings[0].offset : 0);
+		fail("tiled");
+	}
+	memset(got, 0xA5, sizeof(got));
+	if (parse(blob, n, 5, LERC_STREAM_DISCARD, got, sizeof(got), findings, 8, &report) ||
+		report.findings_count || report.bytes_consumed != n || report.sample_bytes || got[0] != 0xA5)
+		fail("tile discard");
+	{
+		enum { M = 8 };
+		int masked[M * M], m_oracle[M * M];
+		unsigned char mask[M * M], gmask[M * M], mgot[M * M];
+		unsigned char mblob[4096];
+		int mout[M * M];
+		unsigned mn = 0, at = 0, flag = 1;
+		for (i = 0; i < M * M; i++) {
+			mask[i] = (unsigned char)(i < 20 || (i % 5) == 0);
+			masked[i] = mask[i] ? (i * 3) & 7 : 0;
+		}
+		if (encode_masked(masked, 4, 1, M, M, 1, 1, mask, mblob, sizeof(mblob), &mn) ||
+			lerc_decode(mblob, mn, 1, mgot, 1, M, M, 1, 4, m_oracle) ||
+			tile_flag(mblob, mn, 1, 4, &at, &flag) || flag != 0) {
+			fprintf(stderr, "stream: tile mask fixture n=%u flag=%u\n", mn, flag);
+			fail("tile mask fixture");
+		} else {
+			memset(mout, 0xA5, sizeof(mout));
+			memset(gmask, 0xA5, sizeof(gmask));
+			if (parse_masked(mblob, mn, 3, 0, (unsigned char *)mout, sizeof(mout), gmask, sizeof(gmask),
+				findings, 8, &report) || report.findings_count || report.bytes_consumed != mn ||
+				report.sample_bytes != sizeof(m_oracle) || report.mask_bytes != M * M ||
+				memcmp(mout, m_oracle, sizeof(m_oracle)) != 0 || memcmp(gmask, mgot, M * M) != 0) {
+				fprintf(stderr, "stream: tile-mask count=%u consumed=%llu samples=%zu mask=%zu code=%u\n",
+					report.findings_count, (unsigned long long)report.bytes_consumed,
+					report.sample_bytes, report.mask_bytes,
+					report.findings_count ? findings[0].code : 0);
+				fail("tile mask");
+			}
+		}
+	}
+	{
+		enum { M = 8 };
+		int sparse[M * M], s_oracle[M * M];
+		unsigned char sblob[4096];
+		int sout[M * M];
+		unsigned sn = 0, at = 0, flag = 1;
+		for (i = 0; i < M * M; i++)
+			sparse[i] = (i % 11) == 0 ? 1000 : 0;
+		if (encode_blob(sparse, -1, 4, 1, M, M, 1, sblob, sizeof(sblob), &sn) ||
+			lerc_decode(sblob, sn, 0, NULL, 1, M, M, 1, 4, s_oracle) ||
+			tile_flag(sblob, sn, 1, 4, &at, &flag) || flag != 0) {
+			fprintf(stderr, "stream: tile lut fixture n=%u flag=%u\n", sn, flag);
+			fail("tile lut fixture");
+		} else {
+			memset(sout, 0xA5, sizeof(sout));
+			if (parse(sblob, sn, 4, 0, (unsigned char *)sout, sizeof(sout), findings, 8, &report) ||
+				report.findings_count || report.bytes_consumed != sn ||
+				report.sample_bytes != sizeof(s_oracle) || memcmp(sout, s_oracle, sizeof(s_oracle)) != 0) {
+				fprintf(stderr, "stream: tile-lut count=%u consumed=%llu samples=%zu code=%u off=%llu\n",
+					report.findings_count, (unsigned long long)report.bytes_consumed,
+					report.sample_bytes, report.findings_count ? findings[0].code : 0,
+					report.findings_count ? (unsigned long long)findings[0].offset : 0);
+				fail("tile lut");
+			}
+		}
+	}
+	{
+		enum { M = 8 };
+		int deep[M * M * 2], d_oracle[M * M * 2];
+		unsigned char dblob[8192];
+		int dout[M * M * 2];
+		unsigned dn = 0, at = 0, flag = 1;
+		for (i = 0; i < M * M; i++) {
+			deep[i * 2] = i & 3;
+			deep[i * 2 + 1] = i & 3;
+		}
+		if (encode_blob(deep, -1, 4, 2, M, M, 1, dblob, sizeof(dblob), &dn) ||
+			lerc_decode(dblob, dn, 0, NULL, 2, M, M, 1, 4, d_oracle) ||
+			tile_flag(dblob, dn, 2, 4, &at, &flag) || flag != 0) {
+			fprintf(stderr, "stream: tile depth fixture n=%u flag=%u\n", dn, flag);
+			fail("tile depth fixture");
+		} else {
+			memset(dout, 0xA5, sizeof(dout));
+			if (parse(dblob, dn, 3, 0, (unsigned char *)dout, sizeof(dout), findings, 8, &report) ||
+				report.findings_count || report.bytes_consumed != dn ||
+				report.sample_bytes != sizeof(d_oracle) || memcmp(dout, d_oracle, sizeof(d_oracle)) != 0) {
+				fprintf(stderr, "stream: tile-depth count=%u consumed=%llu samples=%zu code=%u off=%llu\n",
+					report.findings_count, (unsigned long long)report.bytes_consumed,
+					report.sample_bytes, report.findings_count ? findings[0].code : 0,
+					report.findings_count ? (unsigned long long)findings[0].offset : 0);
+				fail("tile depth");
+			}
+		}
+	}
+	{
+		enum { M = 8 };
+		int deep[M * M * 2], d_oracle[M * M * 2];
+		unsigned char dblob[8192];
+		int dout[M * M * 2];
+		unsigned dn = 0, at = 0, flag = 1;
+		for (i = 0; i < M * M; i++) {
+			deep[i * 2] = i & 3;
+			deep[i * 2 + 1] = 20 + (i & 7);
+		}
+		if (encode_blob(deep, -1, 4, 2, M, M, 1, dblob, sizeof(dblob), &dn) ||
+			lerc_decode(dblob, dn, 0, NULL, 2, M, M, 1, 4, d_oracle) ||
+			tile_flag(dblob, dn, 2, 4, &at, &flag) || flag != 0) {
+			fprintf(stderr, "stream: tile depth-range fixture n=%u flag=%u\n", dn, flag);
+			fail("tile depth-range fixture");
+		} else {
+			memset(dout, 0xA5, sizeof(dout));
+			if (parse(dblob, dn, 3, 0, (unsigned char *)dout, sizeof(dout), findings, 8, &report) ||
+				report.findings_count || report.bytes_consumed != dn ||
+				report.sample_bytes != sizeof(d_oracle) || memcmp(dout, d_oracle, sizeof(d_oracle)) != 0) {
+				fprintf(stderr, "stream: tile-range count=%u consumed=%llu samples=%zu code=%u off=%llu\n",
+					report.findings_count, (unsigned long long)report.bytes_consumed,
+					report.sample_bytes, report.findings_count ? findings[0].code : 0,
+					report.findings_count ? (unsigned long long)findings[0].offset : 0);
+				fail("tile depth-range");
+			}
+		}
+	}
+}
+
 static void test_wrong_param(void)
 {
 	lerc_stream_report report;
@@ -506,7 +774,10 @@ int main(void)
 	test_const_versions();
 	test_one_sweep();
 	test_stored_mask();
-	test_smooth_double_unsupported();
+	test_tiled_ints();
+	test_integer_valued_doubles();
+	test_byte_tiles_mode0();
+	test_huffman_unsupported();
 	test_discard_and_bands();
 	test_truncation_checksum_fields();
 	test_key_version_trailing();
