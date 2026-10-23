@@ -961,9 +961,338 @@ static int read_tiles(Cur *c, uint64_t band_end, int version, int rows, int cols
 	return 1;
 }
 
-/* Flag byte 0. A following Huffman mode other than tiling stays unsupported.
- * Returns 0 only when the walk must stop. *withhold is set when this band
- * must not be published.
+/* Codes and pixel bits are packed MSB-first in each little-endian uint32.
+ * Tile unstuff is the other order; do not reuse it here.
+ */
+static int huff_peek(const unsigned char *buf, size_t len, size_t off, int bit_pos, int nbits, unsigned int *out)
+{
+	unsigned int w = 0, nxt = 0;
+	int sh;
+	if (nbits <= 0 || nbits > 32 || bit_pos < 0 || bit_pos >= 32 || off > len || len - off < 4)
+		return 0;
+	memcpy(&w, buf + off, 4);
+	*out = (w << (unsigned)bit_pos) >> (unsigned)(32 - nbits);
+	if (32 - bit_pos >= nbits)
+		return 1;
+	if (len - off < 8)
+		return 0;
+	memcpy(&nxt, buf + off + 4, 4);
+	sh = 64 - bit_pos - nbits;
+	if (sh <= 0 || sh >= 32)
+		return 0;
+	*out |= nxt >> (unsigned)sh;
+	return 1;
+}
+
+static void huff_advance(size_t *off, int *bit_pos, int nbits)
+{
+	if (32 - *bit_pos >= nbits) {
+		*bit_pos += nbits;
+		if (*bit_pos == 32) {
+			*bit_pos = 0;
+			*off += 4;
+		}
+	} else {
+		*bit_pos += nbits - 32;
+		*off += 4;
+	}
+}
+
+static int huff_wrap(int i, int size)
+{
+	return i < size ? i : i - size;
+}
+
+/* Byte and char Huffman. Mode 1 is a neighbor delta. Mode 2 is the value.
+ * Returns 0 only when the reader already stopped the walk.
+ */
+static int huffman_pull(Cur *c, uint64_t band_end, int rows, int cols, int depth, int dt, int mode,
+	const unsigned char *bits, unsigned char **samples, size_t sample_bytes, int *withhold)
+{
+	enum { HUFF_MAX = 1 << 15, HUFF_LUT = 12 };
+	int32_t hv = 0, hsize = 0, i0 = 0, i1 = 0;
+	int nlen, max_len, num_bits, i, k;
+	int row, col, d;
+	size_t n_out = 0, sum, code_bytes, pay_at, off, stride, m;
+	unsigned int *lengths = NULL;
+	unsigned short *clen = NULL;
+	unsigned int *ccode = NULL;
+	unsigned char *coded = NULL;
+	unsigned char *pay = NULL;
+	unsigned char *img = NULL;
+	struct { short len; short sym; } *lut = NULL;
+	size_t lut_n, pay_n;
+	int bit_pos, rc;
+	if (!read_i32(c, &hv, band_end, 1, NULL) || !read_i32(c, &hsize, band_end, 1, NULL) ||
+		!read_i32(c, &i0, band_end, 1, NULL) || !read_i32(c, &i1, band_end, 1, NULL))
+		return 0;
+	if (hv < 2 || hsize <= 0 || hsize > HUFF_MAX || i0 < 0 || i1 <= i0 ||
+		i0 >= hsize * 2 || (i1 - 1) >= hsize * 2 ||
+		huff_wrap(i0, hsize) >= hsize || huff_wrap(i1 - 1, hsize) >= hsize) {
+		add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+		*withhold = 1;
+		return drain(c, band_end);
+	}
+	nlen = i1 - i0;
+	if (nlen <= 0 || nlen > hsize) {
+		add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+		*withhold = 1;
+		return drain(c, band_end);
+	}
+	lengths = calloc((size_t)nlen, sizeof(unsigned int));
+	clen = calloc((size_t)hsize, sizeof(unsigned short));
+	ccode = calloc((size_t)hsize, sizeof(unsigned int));
+	if (!lengths || !clen || !ccode) {
+		free(lengths);
+		free(clen);
+		free(ccode);
+		add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+		*withhold = 1;
+		return drain(c, band_end);
+	}
+	rc = bitstuff_pull(c, band_end, lengths, (size_t)nlen, &n_out);
+	if (rc != 1 || n_out != (size_t)nlen) {
+		free(lengths);
+		free(clen);
+		free(ccode);
+		if (rc == -1)
+			return 0;
+		if (rc == -2)
+			add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+		else if (rc == 1)
+			add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+		*withhold = 1;
+		return drain(c, band_end);
+	}
+	max_len = 0;
+	sum = 0;
+	for (i = 0; i < nlen; i++) {
+		int len = (int)lengths[i];
+		int idx = huff_wrap(i0 + i, hsize);
+		if (len < 0 || len > 32) {
+			free(lengths);
+			free(clen);
+			free(ccode);
+			add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			*withhold = 1;
+			return drain(c, band_end);
+		}
+		clen[idx] = (unsigned short)len;
+		if (len > max_len)
+			max_len = len;
+		sum += (size_t)len;
+	}
+	free(lengths);
+	lengths = NULL;
+	if (max_len <= 0) {
+		free(clen);
+		free(ccode);
+		add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+		*withhold = 1;
+		return drain(c, band_end);
+	}
+	code_bytes = sum == 0 ? 0 : (((sum + 7) >> 3) + 3) >> 2;
+	code_bytes *= 4;
+	coded = malloc(code_bytes ? code_bytes : 1);
+	if (!coded || (code_bytes && !read_capped(c, coded, code_bytes, band_end, NULL))) {
+		free(coded);
+		free(clen);
+		free(ccode);
+		if (!coded) {
+			add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+			*withhold = 1;
+			return drain(c, band_end);
+		}
+		return 0;
+	}
+	off = 0;
+	bit_pos = 0;
+	for (i = 0; i < nlen; i++) {
+		int idx = huff_wrap(i0 + i, hsize);
+		int len = clen[idx];
+		unsigned int code = 0;
+		if (len <= 0)
+			continue;
+		if (!huff_peek(coded, code_bytes, off, bit_pos, len, &code)) {
+			free(coded);
+			free(clen);
+			free(ccode);
+			add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			*withhold = 1;
+			return drain(c, band_end);
+		}
+		huff_advance(&off, &bit_pos, len);
+		if (len < 32 && (code >> (unsigned)len) != 0) {
+			free(coded);
+			free(clen);
+			free(ccode);
+			add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			*withhold = 1;
+			return drain(c, band_end);
+		}
+		ccode[idx] = code;
+	}
+	free(coded);
+	if (off + (bit_pos > 0 ? 4u : 0u) != code_bytes) {
+		free(clen);
+		free(ccode);
+		add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+		*withhold = 1;
+		return drain(c, band_end);
+	}
+	num_bits = max_len < HUFF_LUT ? max_len : HUFF_LUT;
+	lut_n = (size_t)1 << (unsigned)num_bits;
+	lut = malloc(lut_n * sizeof(*lut));
+	if (!lut) {
+		free(clen);
+		free(ccode);
+		add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+		*withhold = 1;
+		return drain(c, band_end);
+	}
+	for (i = 0; i < (int)lut_n; i++) {
+		lut[i].len = -1;
+		lut[i].sym = -1;
+	}
+	for (k = 0; k < hsize; k++) {
+		int len = clen[k];
+		unsigned int code, nent, j;
+		if (len <= 0 || len > num_bits)
+			continue;
+		code = ccode[k] << (unsigned)(num_bits - len);
+		nent = 1u << (unsigned)(num_bits - len);
+		if ((size_t)code >= lut_n || (size_t)code + nent > lut_n) {
+			free(lut);
+			free(clen);
+			free(ccode);
+			add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			*withhold = 1;
+			return drain(c, band_end);
+		}
+		for (j = 0; j < nent; j++) {
+			lut[code | j].len = (short)len;
+			lut[code | j].sym = (short)k;
+		}
+	}
+	if (c->pos > band_end) {
+		free(lut);
+		free(clen);
+		free(ccode);
+		*withhold = 1;
+		return 0;
+	}
+	pay_n = (size_t)(band_end - c->pos);
+	pay_at = c->pos;
+	pay = malloc(pay_n ? pay_n : 1);
+	img = calloc(1, sample_bytes ? sample_bytes : 1);
+	if (!pay || !img || (pay_n && !read_capped(c, pay, pay_n, band_end, NULL))) {
+		free(pay);
+		free(img);
+		free(lut);
+		free(clen);
+		free(ccode);
+		if (!pay || !img) {
+			add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+			*withhold = 1;
+			return drain(c, band_end);
+		}
+		return 0;
+	}
+	off = 0;
+	bit_pos = 0;
+	stride = (size_t)cols * (size_t)depth;
+	for (d = 0; d < (mode == 1 ? depth : 1); d++) {
+		unsigned char prev = 0;
+		int d0 = mode == 1 ? d : 0;
+		int d1 = mode == 1 ? d + 1 : depth;
+		for (row = 0; row < rows; row++) {
+			for (col = 0; col < cols; col++) {
+				size_t pix = (size_t)row * (size_t)cols + (size_t)col;
+				int dd;
+				if (bits && !bit_on(bits, pix))
+					continue;
+				for (dd = d0; dd < d1; dd++) {
+					unsigned int window = 0;
+					int sym = -1;
+					int len;
+					m = (pix * (size_t)depth) + (size_t)dd;
+					if (!huff_peek(pay, pay_n, off, bit_pos, num_bits, &window) || (size_t)window >= lut_n) {
+						sym = -1;
+					} else if (lut[window].len >= 0) {
+						sym = lut[window].sym;
+						huff_advance(&off, &bit_pos, lut[window].len);
+					} else {
+						for (len = num_bits + 1; len <= max_len; len++) {
+							unsigned int bits_n = 0;
+							int s;
+							if (!huff_peek(pay, pay_n, off, bit_pos, len, &bits_n))
+								break;
+							for (s = 0; s < hsize; s++) {
+								if (clen[s] == len && ccode[s] == bits_n) {
+									sym = s;
+									huff_advance(&off, &bit_pos, len);
+									break;
+								}
+							}
+							if (sym >= 0)
+								break;
+						}
+					}
+					if (sym < 0) {
+						free(pay);
+						free(img);
+						free(lut);
+						free(clen);
+						free(ccode);
+						add_finding(c, pay_at + off, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+						*withhold = 1;
+						return 1;
+					}
+					{
+						unsigned char delta = (unsigned char)(sym - (dt == 0 ? 128 : 0));
+						unsigned char base = prev;
+						int left_ok = col > 0 && (!bits || bit_on(bits, pix - 1));
+						int above_ok = row > 0 && (!bits || bit_on(bits, pix - (size_t)cols));
+						if (mode == 1) {
+							if (left_ok)
+								base = prev;
+							else if (above_ok)
+								base = img[m - stride];
+							else
+								base = prev;
+							delta = (unsigned char)(delta + base);
+							prev = delta;
+						}
+						img[m] = delta;
+					}
+				}
+			}
+		}
+	}
+	free(lut);
+	free(clen);
+	free(ccode);
+	{
+		size_t used = off + (size_t)((bit_pos > 0 ? 1 : 0) + 1) * 4u;
+		if (used != pay_n) {
+			free(pay);
+			free(img);
+			add_finding(c, pay_at + (used < pay_n ? used : pay_n), 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+			*withhold = 1;
+			return 1;
+		}
+	}
+	free(pay);
+	if (c->publishing && (c->report->options & LERC_STREAM_DISCARD) == 0)
+		*samples = img;
+	else
+		free(img);
+	return 1;
+}
+
+/* Flag byte 0. Byte and char Huffman are decoded here. Any other nonzero
+ * mode stays unsupported. Returns 0 only when the walk must stop.
+ * *withhold is set when this band must not be published.
  */
 static int decode_flag0(Cur *c, uint64_t band_end, int version, int rows, int cols, int depth, int dt, int micro,
 	double zerr, double zmax, const double *dmax, const unsigned char *bits, unsigned char **samples,
@@ -979,6 +1308,9 @@ static int decode_flag0(Cur *c, uint64_t band_end, int version, int rows, int co
 		if (!read_capped(c, &mode, 1, band_end, &at))
 			return 0;
 		if (mode != 0) {
+			if ((dt == 0 || dt == 1) && (mode == 1 || (mode == 2 && version >= 4)))
+				return huffman_pull(c, band_end, rows, cols, depth, dt, mode, bits, samples,
+					sample_bytes, withhold);
 			add_finding(c, at, 1, 1, LERC_STREAM_CODE_UNSUPPORTED, LERC_STREAM_CAT_UNSUPPORTED);
 			*withhold = 1;
 			return drain(c, band_end);

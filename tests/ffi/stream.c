@@ -265,6 +265,25 @@ static void test_byte_tiles_mode0(void)
 	expect_clean("byte-tile", blob, n, 3, oracle, sizeof(oracle));
 }
 
+static void expect_huffman_match(const char *name, const void *data, unsigned dt, int es,
+	int cols, int rows, unsigned mode)
+{
+	unsigned char blob[8192];
+	unsigned char oracle[512];
+	unsigned n = 0, at = 0, flag = 1;
+	size_t nbytes = (size_t)cols * (size_t)rows * (size_t)es;
+	if (nbytes > sizeof(oracle) ||
+		encode_blob(data, -1, dt, 1, cols, rows, 1, blob, sizeof(blob), &n) ||
+		lerc_decode(blob, n, 0, NULL, 1, cols, rows, 1, dt, oracle) ||
+		tile_flag(blob, n, 1, es, &at, &flag) || flag != 0 || at + 1 >= n || blob[at + 1] != mode) {
+		fprintf(stderr, "stream: %s fixture n=%u flag=%u mode=%u want=%u\n", name, n, flag,
+			at + 1 < n ? blob[at + 1] : 0, mode);
+		fail(name);
+		return;
+	}
+	expect_clean(name, blob, n, 3, oracle, nbytes);
+}
+
 static void expect_huffman_unsupported(const char *name, const void *data, unsigned dt, int es,
 	int cols, int rows, unsigned mode)
 {
@@ -297,7 +316,7 @@ static void expect_huffman_unsupported(const char *name, const void *data, unsig
 	}
 }
 
-/* Nonzero Huffman modes stay unsupported. The encoder picks the mode. */
+/* Byte and char Huffman must match the blob decoder. Float mode 3 stays unsupported. */
 static void test_huffman_unsupported(void)
 {
 	enum { R = 8, T = 16, D = 48 };
@@ -312,8 +331,8 @@ static void test_huffman_unsupported(void)
 		text[i] = (unsigned char)phrase[i % (int)sizeof(phrase)];
 	for (i = 0; i < D * D; i++)
 		wave[i] = 0.25 * (double)(i % D) + 0.125;
-	expect_huffman_unsupported("huff-delta", ramp, 1, 1, R, R, 1);
-	expect_huffman_unsupported("huff-plain", text, 1, 1, T, T, 2);
+	expect_huffman_match("huff-delta", ramp, 1, 1, R, R, 1);
+	expect_huffman_match("huff-plain", text, 1, 1, T, T, 2);
 	expect_huffman_unsupported("huff-float", wave, 7, (int)sizeof(double), D, D, 3);
 	{
 		unsigned char blob[2048];
@@ -326,9 +345,64 @@ static void test_huffman_unsupported(void)
 		else {
 			memset(samples, 0xA5, sizeof(samples));
 			if (parse(blob, n, 3, LERC_STREAM_DISCARD, samples, sizeof(samples), findings, 4, &report) ||
-				report.findings_count != 1 || findings[0].code != LERC_STREAM_CODE_UNSUPPORTED ||
-				report.bytes_consumed != n || report.sample_bytes || samples[0] != 0xA5)
+				report.findings_count || report.bytes_consumed != n || report.sample_bytes || samples[0] != 0xA5)
 				fail("huff-discard");
+		}
+	}
+	{
+		signed char cold[T * T];
+		for (i = 0; i < T * T; i++)
+			cold[i] = (signed char)((i % 40) - 20);
+		expect_huffman_match("huff-char", cold, 0, 1, T, T, 1);
+	}
+	{
+		enum { M = 8 };
+		unsigned char deep[M * M * 2], oracle[M * M * 2], blob[4096];
+		unsigned n = 0, at = 0, flag = 1;
+		for (i = 0; i < M * M; i++) {
+			deep[i * 2] = (unsigned char)(i & 255);
+			deep[i * 2 + 1] = (unsigned char)((i * 3) & 255);
+		}
+		if (encode_blob(deep, -1, 1, 2, M, M, 1, blob, sizeof(blob), &n) ||
+			lerc_decode(blob, n, 0, NULL, 2, M, M, 1, 1, oracle) ||
+			tile_flag(blob, n, 2, 1, &at, &flag) || flag != 0 || at + 1 >= n || blob[at + 1] != 1) {
+			fprintf(stderr, "stream: huff-depth fixture n=%u flag=%u mode=%u\n", n, flag,
+				at + 1 < n ? blob[at + 1] : 0);
+			fail("huff-depth fixture");
+		} else
+			expect_clean("huff-depth", blob, n, 3, oracle, sizeof(oracle));
+	}
+	{
+		enum { N = 16 };
+		unsigned char data[N * N], mask[N * N], oracle[N * N], omask[N * N];
+		unsigned char got[N * N], gmask[N * N], blob[4096];
+		unsigned n = 0, at = 0, flag = 1;
+		lerc_stream_finding findings[8];
+		lerc_stream_report report;
+		for (i = 0; i < N * N; i++) {
+			data[i] = (unsigned char)(i & 255);
+			mask[i] = (unsigned char)(i < 40 || (i % 5) == 0);
+		}
+		if (encode_masked(data, 1, 1, N, N, 1, 1, mask, blob, sizeof(blob), &n) ||
+			lerc_decode(blob, n, 1, omask, 1, N, N, 1, 1, oracle) ||
+			tile_flag(blob, n, 1, 1, &at, &flag) || flag != 0 || at + 1 >= n || blob[at + 1] != 1) {
+			fprintf(stderr, "stream: huff-mask fixture n=%u flag=%u mode=%u\n", n, flag,
+				at + 1 < n ? blob[at + 1] : 0);
+			fail("huff-mask fixture");
+		} else {
+			memset(got, 0xA5, sizeof(got));
+			memset(gmask, 0xA5, sizeof(gmask));
+			if (parse_masked(blob, n, 3, 0, got, sizeof(got), gmask, sizeof(gmask), findings, 8, &report) ||
+				report.findings_count || report.bytes_consumed != n ||
+				report.sample_bytes != sizeof(oracle) || report.mask_bytes != N * N ||
+				memcmp(got, oracle, sizeof(oracle)) != 0 || memcmp(gmask, omask, sizeof(omask)) != 0) {
+				fprintf(stderr, "stream: huff-mask count=%u consumed=%llu samples=%zu mask=%zu code=%u off=%llu\n",
+					report.findings_count, (unsigned long long)report.bytes_consumed,
+					report.sample_bytes, report.mask_bytes,
+					report.findings_count ? findings[0].code : 0,
+					report.findings_count ? (unsigned long long)findings[0].offset : 0);
+				fail("huff-mask");
+			}
 		}
 	}
 }

@@ -19,8 +19,9 @@ extern "C" {
  * buffer missing when discard is off).
  *
  * Payload parsed in this slice: empty masks, stored RLE masks, constant
- * bands, per-depth constant ranges, raw one-sweep samples, and tiled
- * bit-stuffing. Huffman coding is category unsupported, not corrupt.
+ * bands, per-depth constant ranges, raw one-sweep samples, tiled
+ * bit-stuffing, and byte or char Huffman. Lossless float Huffman is
+ * category unsupported, not corrupt.
  *
  * When mask is non-NULL, each published band appends one byte per pixel,
  * 1 for valid and 0 for invalid. A NULL mask is still parsed.
