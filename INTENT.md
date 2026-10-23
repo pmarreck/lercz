@@ -41,8 +41,9 @@ maximum error per pixel, including zero for lossless compression.
   Zig or Nix and fails if freshness cannot be verified. Raw build graphs and
   deterministic tests stay offline for sandboxed packaging, downstream
   dependencies, and maintenance. See README for the enforcement boundary.
-- A pure-Zig codec rewrite, a raster editing application, and changes to the
-  LERC format are outside this fork's purpose.
+- A pure-Zig codec rewrite, a raster editing application, changes to the
+  LERC format, and localization of library or CLI messages are outside this
+  fork's purpose. The CLI stays English-only.
 
 ## Evidence of success
 
