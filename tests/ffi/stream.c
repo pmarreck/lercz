@@ -3,6 +3,7 @@
 #include "Lerc_stream.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_failures;
@@ -284,56 +285,71 @@ static void expect_huffman_match(const char *name, const void *data, unsigned dt
 	expect_clean(name, blob, n, 3, oracle, nbytes);
 }
 
-static void expect_huffman_unsupported(const char *name, const void *data, unsigned dt, int es,
-	int cols, int rows, unsigned mode)
+static void expect_sized(const char *name, const unsigned char *blob, unsigned n, size_t chunk,
+	const void *oracle, size_t nbytes)
 {
-	unsigned char blob[8192];
-	unsigned char samples[16];
-	unsigned n = 0, at = 0, flag = 1;
+	unsigned char *got = malloc(nbytes ? nbytes : 1);
 	lerc_stream_finding findings[8];
-	lerc_stream_finding want[1];
 	lerc_stream_report report;
-	if (encode_blob(data, -1, dt, 1, cols, rows, 1, blob, sizeof(blob), &n) ||
-		tile_flag(blob, n, 1, es, &at, &flag) || flag != 0 || at + 1 >= n || blob[at + 1] != mode) {
-		fprintf(stderr, "stream: %s fixture n=%u flag=%u mode=%u want=%u\n", name, n, flag,
-			at + 1 < n ? blob[at + 1] : 0, mode);
+	if (!got) {
 		fail(name);
 		return;
 	}
-	memset(samples, 0xA5, sizeof(samples));
-	if (parse(blob, n, 3, 0, samples, sizeof(samples), findings, 8, &report))
+	memset(got, 0xA5, nbytes ? nbytes : 1);
+	if (parse(blob, n, chunk, 0, got, nbytes, findings, 8, &report) ||
+		report.findings_count || report.findings_omitted || report.stopped ||
+		report.bytes_consumed != n || report.sample_bytes != nbytes ||
+		memcmp(got, oracle, nbytes) != 0) {
+		fprintf(stderr, "stream: %s count=%u omitted=%u stopped=%u consumed=%llu samples=%zu code=%u off=%llu\n",
+			name, report.findings_count, report.findings_omitted, report.stopped,
+			(unsigned long long)report.bytes_consumed, report.sample_bytes,
+			report.findings_count ? findings[0].code : 0,
+			report.findings_count ? (unsigned long long)findings[0].offset : 0);
 		fail(name);
-	else {
-		memset(want, 0, sizeof(want));
-		want[0].offset = (uint64_t)at + 1;
-		want[0].length = 1;
-		want[0].code = LERC_STREAM_CODE_UNSUPPORTED;
-		want[0].category = LERC_STREAM_CAT_UNSUPPORTED;
-		want[0].flags = LERC_STREAM_LENGTH_PRESENT;
-		expect_exact(name, &report, want, 1, 0, n);
-		if (report.sample_bytes || samples[0] != 0xA5)
-			fail(name);
 	}
+	free(got);
 }
 
-/* Byte and char Huffman must match the blob decoder. Float mode 3 stays unsupported. */
+/* Lossless float and double mode 3 must match the blob decoder. */
+static void expect_float_huff(const char *name, const void *data, unsigned dt, int es, int depth,
+	int cols, int rows)
+{
+	size_t nbytes = (size_t)cols * (size_t)rows * (size_t)depth * (size_t)es;
+	unsigned char *blob = malloc(nbytes + 65536);
+	void *oracle = malloc(nbytes ? nbytes : 1);
+	unsigned n = 0, at = 0, flag = 1;
+	if (!blob || !oracle) {
+		free(blob);
+		free(oracle);
+		fail(name);
+		return;
+	}
+	if (encode_blob(data, -1, dt, depth, cols, rows, 1, blob, (unsigned)(nbytes + 65536), &n) ||
+		lerc_decode(blob, n, 0, NULL, depth, cols, rows, 1, dt, oracle) ||
+		tile_flag(blob, n, depth, es, &at, &flag) || flag != 0 || at + 1 >= n || blob[at + 1] != 3) {
+		fprintf(stderr, "stream: %s fixture n=%u flag=%u mode=%u\n", name, n, flag,
+			at + 1 < n ? blob[at + 1] : 0);
+		fail(name);
+	} else
+		expect_sized(name, blob, n, 3, oracle, nbytes);
+	free(blob);
+	free(oracle);
+}
+
+/* Byte and char Huffman must match the blob decoder. */
 static void test_huffman_unsupported(void)
 {
-	enum { R = 8, T = 16, D = 48 };
+	enum { R = 8, T = 16 };
 	unsigned char ramp[R * R];
 	unsigned char text[T * T];
-	double wave[D * D];
 	static const char phrase[] = "LERC huffman wins on smooth bytes.";
 	int i;
 	for (i = 0; i < R * R; i++)
 		ramp[i] = (unsigned char)(i & 255);
 	for (i = 0; i < T * T; i++)
 		text[i] = (unsigned char)phrase[i % (int)sizeof(phrase)];
-	for (i = 0; i < D * D; i++)
-		wave[i] = 0.25 * (double)(i % D) + 0.125;
 	expect_huffman_match("huff-delta", ramp, 1, 1, R, R, 1);
 	expect_huffman_match("huff-plain", text, 1, 1, T, T, 2);
-	expect_huffman_unsupported("huff-float", wave, 7, (int)sizeof(double), D, D, 3);
 	{
 		unsigned char blob[2048];
 		unsigned char samples[16];
@@ -828,6 +844,72 @@ static void test_tiled_ints(void)
 	}
 }
 
+static void test_float_huffman(void)
+{
+	enum { S = 16, W = 32, D = 48 };
+	double ramp[S * S];
+	float delta[S * S];
+	float cross[W * W];
+	double wide[D * D];
+	int i;
+	for (i = 0; i < S * S; i++)
+		ramp[i] = 0.25 * (double)(i % S) + 0.125;
+	expect_float_huff("huff-double-rows", ramp, 7, (int)sizeof(double), 1, S, S);
+	for (i = 0; i < S * S; i++)
+		delta[i] = 0.1f * (float)(i & 15) + 0.03f * (float)(i / S);
+	expect_float_huff("huff-float-delta", delta, 6, (int)sizeof(float), 1, S, S);
+	for (i = 0; i < W * W; i++)
+		cross[i] = 0.1f * (float)(i & 15) + 0.03f * (float)(i / W);
+	expect_float_huff("huff-float-cross", cross, 6, (int)sizeof(float), 1, W, W);
+	for (i = 0; i < D * D; i++)
+		wide[i] = 0.25 * (double)(i % D) + 0.125;
+	expect_float_huff("huff-double-wide", wide, 7, (int)sizeof(double), 1, D, D);
+	{
+		enum { L = 96, P = 32 };
+		float *level = malloc(sizeof(float) * L * L);
+		float *fdeep = malloc(sizeof(float) * P * P * 2);
+		double *ddeep = malloc(sizeof(double) * P * P * 2);
+		if (!level || !fdeep || !ddeep) {
+			free(level);
+			free(fdeep);
+			free(ddeep);
+			fail("huff-float-extra alloc");
+		} else {
+			for (i = 0; i < L * L; i++)
+				level[i] = 0.1f * (float)(i & 255) + 0.03f * (float)(i / 128) +
+					0.001f * (float)((i * 17) & 63);
+			expect_float_huff("huff-float-level", level, 6, (int)sizeof(float), 1, L, L);
+			for (i = 0; i < P * P; i++) {
+				fdeep[i * 2] = 0.1f * (float)(i & 15) + 0.03f * (float)(i / P);
+				fdeep[i * 2 + 1] = 0.2f * (float)(i & 15) + 0.01f * (float)(i / P);
+				ddeep[i * 2] = 0.25 * (double)(i % P) + 0.125;
+				ddeep[i * 2 + 1] = 0.5 * (double)(i % P) + 0.25;
+			}
+			expect_float_huff("huff-float-depth", fdeep, 6, (int)sizeof(float), 2, P, P);
+			expect_float_huff("huff-double-depth", ddeep, 7, (int)sizeof(double), 2, P, P);
+			free(level);
+			free(fdeep);
+			free(ddeep);
+		}
+	}
+	{
+		unsigned char blob[16384];
+		unsigned char samples[16];
+		unsigned n = 0, at = 0, flag = 1;
+		lerc_stream_finding findings[4];
+		lerc_stream_report report;
+		if (encode_blob(delta, -1, 6, 1, S, S, 1, blob, sizeof(blob), &n) ||
+			tile_flag(blob, n, 1, (int)sizeof(float), &at, &flag) || flag != 0 || at + 1 >= n || blob[at + 1] != 3)
+			fail("huff-float-discard fixture");
+		else {
+			memset(samples, 0xA5, sizeof(samples));
+			if (parse(blob, n, 3, LERC_STREAM_DISCARD, samples, sizeof(samples), findings, 4, &report) ||
+				report.findings_count || report.bytes_consumed != n || report.sample_bytes || samples[0] != 0xA5)
+				fail("huff-float-discard");
+		}
+	}
+}
+
 static void test_wrong_param(void)
 {
 	lerc_stream_report report;
@@ -852,6 +934,7 @@ int main(void)
 	test_integer_valued_doubles();
 	test_byte_tiles_mode0();
 	test_huffman_unsupported();
+	test_float_huffman();
 	test_discard_and_bands();
 	test_truncation_checksum_fields();
 	test_key_version_trailing();

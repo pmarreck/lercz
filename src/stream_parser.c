@@ -1290,9 +1290,680 @@ static int huffman_pull(Cur *c, uint64_t band_end, int rows, int cols, int depth
 	return 1;
 }
 
-/* Flag byte 0. Byte and char Huffman are decoded here. Any other nonzero
- * mode stays unsupported. Returns 0 only when the walk must stop.
- * *withhold is set when this band must not be published.
+/* Memory cursor for a plane blob that has already been pulled off the band. */
+typedef struct {
+	const unsigned char *p;
+	size_t n;
+	size_t i;
+} Bcur;
+
+static int b_take(Bcur *b, void *dst, size_t n)
+{
+	if (b->i > b->n || n > b->n - b->i)
+		return 0;
+	if (n && dst)
+		memcpy(dst, b->p + b->i, n);
+	b->i += n;
+	return 1;
+}
+
+/* LSB-first unpack, same word layout as unstuff_pull, over a fixed buffer. */
+static int b_unstuff(Bcur *b, unsigned int *dst, unsigned int n_elem, int num_bits)
+{
+	unsigned long long nuints_ll;
+	size_t nuints, nbytes, used;
+	unsigned int tail, *words, *sp, i;
+	int bit_pos, nb;
+	if (n_elem == 0 || num_bits <= 0 || num_bits >= 32)
+		return 0;
+	nuints_ll = ((unsigned long long)n_elem * (unsigned int)num_bits + 31ull) / 32ull;
+	if (nuints_ll > SIZE_MAX / 4)
+		return 0;
+	nuints = (size_t)nuints_ll;
+	nbytes = nuints * 4;
+	tail = tail_unused(n_elem, num_bits);
+	if ((size_t)tail > nbytes)
+		return 0;
+	used = nbytes - tail;
+	words = calloc(nuints, 4);
+	if (!words)
+		return -2;
+	if (!b_take(b, words, used)) {
+		free(words);
+		return 0;
+	}
+	bit_pos = 0;
+	nb = 32 - num_bits;
+	sp = words;
+	for (i = 0; i < n_elem; i++) {
+		if (nb - bit_pos >= 0) {
+			unsigned int w = *sp;
+			dst[i] = (w << (unsigned)(nb - bit_pos)) >> (unsigned)nb;
+			bit_pos += num_bits;
+			if (bit_pos == 32) {
+				sp++;
+				bit_pos = 0;
+			}
+		} else {
+			unsigned int v = (*sp++) >> (unsigned)bit_pos;
+			int sh = 64 - num_bits - bit_pos;
+			if (sh < 0 || sh >= 32) {
+				free(words);
+				return 0;
+			}
+			v |= ((*sp) << (unsigned)sh) >> (unsigned)nb;
+			dst[i] = v;
+			bit_pos -= nb;
+		}
+	}
+	free(words);
+	return 1;
+}
+
+/* BitStuffer2::Decode for a version >= 3 field stored in a plane blob. */
+static int b_bitstuff(Bcur *b, unsigned int *dst, size_t max_count, size_t *n_out)
+{
+	unsigned char hdr = 0;
+	int bits67, nb, lut, num_bits;
+	unsigned int n_elem = 0;
+	unsigned char raw[4];
+	if (!b_take(b, &hdr, 1))
+		return 0;
+	bits67 = hdr >> 6;
+	nb = bits67 == 0 ? 4 : 3 - bits67;
+	lut = (hdr >> 5) & 1;
+	num_bits = hdr & 31;
+	if (nb != 1 && nb != 2 && nb != 4)
+		return 0;
+	if (!b_take(b, raw, (size_t)nb))
+		return 0;
+	if (nb == 1)
+		n_elem = raw[0];
+	else if (nb == 2)
+		n_elem = (unsigned int)raw[0] | ((unsigned int)raw[1] << 8);
+	else
+		memcpy(&n_elem, raw, 4);
+	if ((size_t)n_elem > max_count)
+		return 0;
+	if (!lut) {
+		if (num_bits == 0) {
+			if (n_elem)
+				memset(dst, 0, (size_t)n_elem * sizeof(unsigned int));
+			*n_out = n_elem;
+			return 1;
+		}
+		{
+			int ur = b_unstuff(b, dst, n_elem, num_bits);
+			if (ur != 1)
+				return ur;
+		}
+		*n_out = n_elem;
+		return 1;
+	}
+	if (num_bits == 0)
+		return 0;
+	{
+		unsigned char lut_n = 0;
+		unsigned int n_lut, i, *lutv;
+		int nbits = 0;
+		if (!b_take(b, &lut_n, 1) || lut_n == 0)
+			return 0;
+		n_lut = (unsigned int)lut_n - 1u;
+		if (n_lut == 0)
+			return 0;
+		lutv = calloc((size_t)n_lut + 1u, sizeof(unsigned int));
+		if (!lutv)
+			return -2;
+		{
+			int ur = b_unstuff(b, lutv + 1, n_lut, num_bits);
+			if (ur != 1) {
+				free(lutv);
+				return ur;
+			}
+		}
+		while ((n_lut >> nbits) != 0)
+			nbits++;
+		if (nbits <= 0 || nbits >= 32) {
+			free(lutv);
+			return 0;
+		}
+		{
+			int ur = b_unstuff(b, dst, n_elem, nbits);
+			if (ur != 1) {
+				free(lutv);
+				return ur;
+			}
+		}
+		for (i = 0; i < n_elem; i++) {
+			if (dst[i] > n_lut) {
+				free(lutv);
+				return 0;
+			}
+			dst[i] = lutv[dst[i]];
+		}
+		free(lutv);
+		*n_out = n_elem;
+		return 1;
+	}
+}
+
+/* PackBits as fpl_EsriHuffman::decodePackBits. The run check is curr+b, not curr+b+1. */
+static int packbits_decode(const unsigned char *ptr, size_t size, size_t expected, unsigned char **out)
+{
+	unsigned char *dst = malloc(expected ? expected : 1);
+	size_t curr = 0, i = 0;
+	if (!dst)
+		return -2;
+	while (i < size) {
+		int b = ptr[i++];
+		if (b <= 127) {
+			size_t b1 = (size_t)b + 1u;
+			if (curr + (size_t)b >= expected || i + b1 > size) {
+				free(dst);
+				return 0;
+			}
+			memcpy(dst + curr, ptr + i, b1);
+			curr += b1;
+			i += b1;
+		} else {
+			size_t b1 = (size_t)b - 127u + 1u;
+			if (curr + (size_t)b - 127u >= expected || i >= size) {
+				free(dst);
+				return 0;
+			}
+			memset(dst + curr, ptr[i], b1);
+			curr += b1;
+			i++;
+		}
+	}
+	if (curr != expected) {
+		free(dst);
+		return 0;
+	}
+	*out = dst;
+	return 1;
+}
+
+/* One byte plane. Flag 0 is Huffman, 1 is RLE, 2 is raw, 3 is PackBits.
+ * Huffman stops after `expect` symbols. Padding inside the blob is allowed.
+ * Returns 1, 0 for a bad blob, or -2 on allocation failure.
+ */
+static int plane_decode(const unsigned char *in, size_t in_n, size_t expect, unsigned char **out)
+{
+	enum { HUFF_MAX = 1 << 15, HUFF_LUT = 12 };
+	unsigned char *dst = NULL;
+	if (!in || in_n < 1 || expect == 0)
+		return 0;
+	if (in[0] == 1) {
+		uint32_t rle = 0;
+		if (in_n < 6)
+			return 0;
+		memcpy(&rle, in + 2, 4);
+		if ((size_t)rle != expect)
+			return 0;
+		dst = malloc(expect);
+		if (!dst)
+			return -2;
+		memset(dst, in[1], expect);
+		*out = dst;
+		return 1;
+	}
+	if (in[0] == 2) {
+		if (in_n < 1 + expect)
+			return 0;
+		dst = malloc(expect);
+		if (!dst)
+			return -2;
+		memcpy(dst, in + 1, expect);
+		*out = dst;
+		return 1;
+	}
+	if (in[0] == 3)
+		return packbits_decode(in + 1, in_n - 1, expect, out);
+	if (in[0] != 0)
+		return 0;
+	{
+		Bcur b;
+		int32_t hv = 0, hsize = 0, i0 = 0, i1 = 0;
+		int nlen, max_len, num_bits, i, k, bit_pos;
+		size_t n_out = 0, sum, code_bytes, off, lut_n;
+		unsigned int *lengths = NULL;
+		unsigned short *clen = NULL;
+		unsigned int *ccode = NULL;
+		struct { short len; short sym; } *lut = NULL;
+		unsigned char hdr[16];
+		int rc;
+		b.p = in + 1;
+		b.n = in_n - 1;
+		b.i = 0;
+		if (!b_take(&b, hdr, 16))
+			return 0;
+		hv = (int32_t)((uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8) | ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24));
+		hsize = (int32_t)((uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) | ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24));
+		i0 = (int32_t)((uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8) | ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24));
+		i1 = (int32_t)((uint32_t)hdr[12] | ((uint32_t)hdr[13] << 8) | ((uint32_t)hdr[14] << 16) | ((uint32_t)hdr[15] << 24));
+		if (hv < 2 || hsize <= 0 || hsize > HUFF_MAX || i0 < 0 || i1 <= i0 ||
+			i0 >= hsize * 2 || (i1 - 1) >= hsize * 2 ||
+			huff_wrap(i0, hsize) >= hsize || huff_wrap(i1 - 1, hsize) >= hsize)
+			return 0;
+		nlen = i1 - i0;
+		if (nlen <= 0 || nlen > hsize)
+			return 0;
+		lengths = calloc((size_t)nlen, sizeof(unsigned int));
+		clen = calloc((size_t)hsize, sizeof(unsigned short));
+		ccode = calloc((size_t)hsize, sizeof(unsigned int));
+		if (!lengths || !clen || !ccode) {
+			free(lengths);
+			free(clen);
+			free(ccode);
+			return -2;
+		}
+		rc = b_bitstuff(&b, lengths, (size_t)nlen, &n_out);
+		if (rc == -2) {
+			free(lengths);
+			free(clen);
+			free(ccode);
+			return -2;
+		}
+		if (rc != 1 || n_out != (size_t)nlen) {
+			free(lengths);
+			free(clen);
+			free(ccode);
+			return 0;
+		}
+		max_len = 0;
+		sum = 0;
+		for (i = 0; i < nlen; i++) {
+			int len = (int)lengths[i];
+			int idx = huff_wrap(i0 + i, hsize);
+			if (len < 0 || len > 32) {
+				free(lengths);
+				free(clen);
+				free(ccode);
+				return 0;
+			}
+			clen[idx] = (unsigned short)len;
+			if (len > max_len)
+				max_len = len;
+			sum += (size_t)len;
+		}
+		free(lengths);
+		lengths = NULL;
+		if (max_len <= 0) {
+			free(clen);
+			free(ccode);
+			return 0;
+		}
+		code_bytes = sum == 0 ? 0 : (((sum + 7) >> 3) + 3) >> 2;
+		code_bytes *= 4;
+		if (b.i > b.n || code_bytes > b.n - b.i) {
+			free(clen);
+			free(ccode);
+			return 0;
+		}
+		off = 0;
+		bit_pos = 0;
+		for (i = 0; i < nlen; i++) {
+			int idx = huff_wrap(i0 + i, hsize);
+			int len = clen[idx];
+			unsigned int code = 0;
+			if (len <= 0)
+				continue;
+			if (!huff_peek(b.p + b.i, code_bytes, off, bit_pos, len, &code) ||
+				(len < 32 && (code >> (unsigned)len) != 0)) {
+				free(clen);
+				free(ccode);
+				return 0;
+			}
+			huff_advance(&off, &bit_pos, len);
+			ccode[idx] = code;
+		}
+		if (off + (bit_pos > 0 ? 4u : 0u) != code_bytes) {
+			free(clen);
+			free(ccode);
+			return 0;
+		}
+		b.i += code_bytes;
+		num_bits = max_len < HUFF_LUT ? max_len : HUFF_LUT;
+		lut_n = (size_t)1 << (unsigned)num_bits;
+		lut = malloc(lut_n * sizeof(*lut));
+		dst = malloc(expect);
+		if (!lut || !dst) {
+			free(lut);
+			free(dst);
+			free(clen);
+			free(ccode);
+			return -2;
+		}
+		for (i = 0; i < (int)lut_n; i++) {
+			lut[i].len = -1;
+			lut[i].sym = -1;
+		}
+		for (k = 0; k < hsize; k++) {
+			int len = clen[k];
+			unsigned int code, nent, j;
+			if (len <= 0 || len > num_bits)
+				continue;
+			code = ccode[k] << (unsigned)(num_bits - len);
+			nent = 1u << (unsigned)(num_bits - len);
+			if ((size_t)code >= lut_n || (size_t)code + nent > lut_n) {
+				free(lut);
+				free(dst);
+				free(clen);
+				free(ccode);
+				return 0;
+			}
+			for (j = 0; j < nent; j++) {
+				lut[code | j].len = (short)len;
+				lut[code | j].sym = (short)k;
+			}
+		}
+		off = 0;
+		bit_pos = 0;
+		{
+			size_t m;
+			for (m = 0; m < expect; m++) {
+				unsigned int window = 0;
+				int sym = -1;
+				int len;
+				size_t left = b.n - b.i;
+				if (!huff_peek(b.p + b.i, left, off, bit_pos, num_bits, &window) || (size_t)window >= lut_n)
+					sym = -1;
+				else if (lut[window].len >= 0) {
+					sym = lut[window].sym;
+					huff_advance(&off, &bit_pos, lut[window].len);
+				} else {
+					for (len = num_bits + 1; len <= max_len; len++) {
+						unsigned int bits_n = 0;
+						int s;
+						if (!huff_peek(b.p + b.i, left, off, bit_pos, len, &bits_n))
+							break;
+						for (s = 0; s < hsize; s++) {
+							if (clen[s] == len && ccode[s] == bits_n) {
+								sym = s;
+								huff_advance(&off, &bit_pos, len);
+								break;
+							}
+						}
+						if (sym >= 0)
+							break;
+					}
+				}
+				if (sym < 0) {
+					free(lut);
+					free(dst);
+					free(clen);
+					free(ccode);
+					return 0;
+				}
+				dst[m] = (unsigned char)sym;
+			}
+		}
+		free(lut);
+		free(clen);
+		free(ccode);
+		*out = dst;
+		return 1;
+	}
+}
+
+/* Repeated prefix sum. Level 0 is a no-op. Each pass starts one byte later. */
+static void restore_sequence(unsigned char *data, size_t size, int level)
+{
+	int l;
+	if (level <= 0 || size == 0)
+		return;
+	for (l = level; l > 0; l--) {
+		size_t i;
+		for (i = (size_t)l; i < size; i++)
+			data[i] = (unsigned char)(data[i] + data[i - 1]);
+	}
+}
+
+/* Add mantissas and the exponent field separately. No carry between them. */
+static uint32_t add32_bits(uint32_t a, uint32_t b)
+{
+	uint32_t mant = (a + b) & 0x007fffffu;
+	uint32_t ae = (a >> 23) & 0x1ffu;
+	uint32_t be = (b >> 23) & 0x1ffu;
+	return mant | (((ae + be) & 0x1ffu) << 23);
+}
+
+static uint64_t add64_bits(uint64_t a, uint64_t b)
+{
+	const uint64_t mask = 0x000fffffffffffffull;
+	uint64_t mant = ((a & mask) + (b & mask)) & mask;
+	uint64_t ae = (a >> 52) & 0xfffu;
+	uint64_t be = (b >> 52) & 0xfffu;
+	return mant | (((ae + be) & 0xfffu) << 52);
+}
+
+/* Inverse of moveBits2Front: exponent back to bits 23..30, sign to bit 31. */
+static uint32_t undo_float_bits(uint32_t a)
+{
+	uint32_t mant = a & 0x007fffffu;
+	uint32_t exp = (a >> 24) & 0xffu;
+	uint32_t sign = (a >> 23) & 1u;
+	return mant | (exp << 23) | (sign << 31);
+}
+
+static void add_elems(unsigned char *dst, const unsigned char *src, int is_float)
+{
+	if (is_float) {
+		uint32_t a = 0, b = 0, s;
+		memcpy(&a, dst, 4);
+		memcpy(&b, src, 4);
+		s = add32_bits(a, b);
+		memcpy(dst, &s, 4);
+	} else {
+		uint64_t a = 0, b = 0, s;
+		memcpy(&a, dst, 8);
+		memcpy(&b, src, 8);
+		s = add64_bits(a, b);
+		memcpy(dst, &s, 8);
+	}
+}
+
+/* Horizontal delta. Delta 2 first updates columns 2.. from the left neighbor, then columns 1.. again. */
+static void restore_rows(unsigned char *data, size_t cols, size_t rows, int es, int delta, int is_float)
+{
+	size_t r, i;
+	if (delta <= 0 || cols == 0)
+		return;
+	if (delta == 2) {
+		for (r = 0; r < rows; r++) {
+			unsigned char *row = data + r * cols * (size_t)es;
+			for (i = 2; i < cols; i++)
+				add_elems(row + i * (size_t)es, row + (i - 1) * (size_t)es, is_float);
+		}
+	}
+	for (r = 0; r < rows; r++) {
+		unsigned char *row = data + r * cols * (size_t)es;
+		for (i = 1; i < cols; i++)
+			add_elems(row + i * (size_t)es, row + (i - 1) * (size_t)es, is_float);
+	}
+}
+
+/* Column delta, then the same horizontal pass. Used for the rows-and-cols predictor. */
+static void restore_cross(unsigned char *data, size_t cols, size_t rows, int es, int is_float)
+{
+	size_t c, i, r;
+	for (c = 0; c < cols; c++) {
+		for (i = 1; i < rows; i++) {
+			size_t dst = (i * cols + c) * (size_t)es;
+			size_t src = ((i - 1) * cols + c) * (size_t)es;
+			add_elems(data + dst, data + src, is_float);
+		}
+	}
+	for (r = 0; r < rows; r++) {
+		unsigned char *row = data + r * cols * (size_t)es;
+		for (i = 1; i < cols; i++)
+			add_elems(row + i * (size_t)es, row + (i - 1) * (size_t)es, is_float);
+	}
+}
+
+static void undo_floats(unsigned char *data, size_t nfloat)
+{
+	size_t i;
+	for (i = 0; i < nfloat; i++) {
+		uint32_t v = 0, u;
+		memcpy(&v, data + i * 4, 4);
+		u = undo_float_bits(v);
+		memcpy(data + i * 4, &u, 4);
+	}
+}
+
+static void free_planes(unsigned char **planes, int n)
+{
+	int i;
+	for (i = 0; i < n; i++) {
+		free(planes[i]);
+		planes[i] = NULL;
+	}
+}
+
+static int float_fmt(Cur *c, uint64_t band_end, uint64_t at, unsigned char **planes, int *withhold)
+{
+	free_planes(planes, 8);
+	add_finding(c, at, 1, 1, LERC_STREAM_CODE_CONSUMPTION, LERC_STREAM_CAT_FORMAT);
+	*withhold = 1;
+	return drain(c, band_end);
+}
+
+static int float_oom(Cur *c, uint64_t band_end, unsigned char **planes, int *withhold)
+{
+	free_planes(planes, 8);
+	add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+	*withhold = 1;
+	return drain(c, band_end);
+}
+
+/* Lossless float and double mode 3. Byte planes, then a spatial predictor.
+ * Does not call LosslessFPCompression or the blob Huffman decoder.
+ * Returns 0 only when the reader already stopped the walk.
+ */
+static int float_huffman_pull(Cur *c, uint64_t band_end, int rows, int cols, int depth, int dt,
+	unsigned char **samples, size_t sample_bytes, int *withhold)
+{
+	int es = dt == 7 ? 8 : 4;
+	int is_float = dt == 6;
+	int publish = c->publishing && (c->report->options & LERC_STREAM_DISCARD) == 0;
+	int p, seen_n;
+	unsigned char pred = 0;
+	unsigned char *planes[8];
+	unsigned char seen[8];
+	unsigned char *block = NULL;
+	uint64_t pred_at = 0;
+	size_t width, height, npix, bytes, i;
+	for (p = 0; p < 8; p++) {
+		planes[p] = NULL;
+		seen[p] = 0;
+	}
+	if (depth == 1) {
+		width = (size_t)cols;
+		height = (size_t)rows;
+	} else {
+		if ((size_t)cols != 0 && (size_t)rows > SIZE_MAX / (size_t)cols)
+			return float_oom(c, band_end, planes, withhold);
+		width = (size_t)depth;
+		height = (size_t)rows * (size_t)cols;
+	}
+	if (width != 0 && height > SIZE_MAX / width)
+		return float_oom(c, band_end, planes, withhold);
+	npix = width * height;
+	if (npix != 0 && (size_t)es > SIZE_MAX / npix)
+		return float_oom(c, band_end, planes, withhold);
+	bytes = npix * (size_t)es;
+	if (!read_capped(c, &pred, 1, band_end, &pred_at))
+		return 0;
+	if (pred > 2)
+		return float_fmt(c, band_end, pred_at, planes, withhold);
+	for (p = 0; p < es; p++) {
+		unsigned char idx = 0, level = 0, sb[4];
+		unsigned char *comp = NULL, *raw = NULL;
+		uint32_t csize = 0;
+		uint64_t idx_at = 0, level_at = 0, size_at = 0, comp_at;
+		int pr;
+		if (!read_capped(c, &idx, 1, band_end, &idx_at)) {
+			free_planes(planes, 8);
+			return 0;
+		}
+		if (idx >= (unsigned char)es)
+			return float_fmt(c, band_end, idx_at, planes, withhold);
+		if (!read_capped(c, &level, 1, band_end, &level_at)) {
+			free_planes(planes, 8);
+			return 0;
+		}
+		if (level > 5)
+			return float_fmt(c, band_end, level_at, planes, withhold);
+		if (!read_capped(c, sb, 4, band_end, &size_at)) {
+			free_planes(planes, 8);
+			return 0;
+		}
+		csize = (uint32_t)sb[0] | ((uint32_t)sb[1] << 8) | ((uint32_t)sb[2] << 16) | ((uint32_t)sb[3] << 24);
+		comp_at = c->pos;
+		if (csize == 0 || c->pos > band_end || (uint64_t)csize > band_end - c->pos)
+			return float_fmt(c, band_end, size_at, planes, withhold);
+		comp = malloc(csize);
+		if (!comp)
+			return float_oom(c, band_end, planes, withhold);
+		if (!read_capped(c, comp, csize, band_end, NULL)) {
+			free(comp);
+			free_planes(planes, 8);
+			return 0;
+		}
+		pr = plane_decode(comp, csize, npix, &raw);
+		free(comp);
+		if (pr == -2)
+			return float_oom(c, band_end, planes, withhold);
+		if (pr != 1)
+			return float_fmt(c, band_end, comp_at, planes, withhold);
+		restore_sequence(raw, npix, (int)level);
+		if (seen[idx]) {
+			free(raw);
+			return float_fmt(c, band_end, idx_at, planes, withhold);
+		}
+		seen[idx] = 1;
+		planes[idx] = raw;
+	}
+	seen_n = 0;
+	for (p = 0; p < es; p++)
+		if (seen[p])
+			seen_n++;
+	if (seen_n != es)
+		return float_fmt(c, band_end, c->pos, planes, withhold);
+	if (!publish) {
+		free_planes(planes, 8);
+		return 1;
+	}
+	if (sample_bytes != bytes) {
+		free_planes(planes, 8);
+		add_finding(c, c->pos, 0, 0, LERC_STREAM_CODE_BUFFER, LERC_STREAM_CAT_LIMIT);
+		*withhold = 1;
+		return drain(c, band_end);
+	}
+	block = calloc(1, bytes ? bytes : 1);
+	if (!block)
+		return float_oom(c, band_end, planes, withhold);
+	for (i = 0; i < npix; i++) {
+		int b;
+		for (b = 0; b < es; b++)
+			block[i * (size_t)es + (size_t)b] = planes[b][i];
+	}
+	free_planes(planes, 8);
+	if (pred == 2)
+		restore_cross(block, width, height, es, is_float);
+	else
+		restore_rows(block, width, height, es, (int)pred, is_float);
+	if (is_float)
+		undo_floats(block, npix);
+	*samples = block;
+	return 1;
+}
+
+/* Flag byte 0. Byte, char, and lossless float Huffman are decoded here.
+ * Any other nonzero mode stays unsupported. Returns 0 only when the walk
+ * must stop. *withhold is set when this band must not be published.
  */
 static int decode_flag0(Cur *c, uint64_t band_end, int version, int rows, int cols, int depth, int dt, int micro,
 	double zerr, double zmax, const double *dmax, const unsigned char *bits, unsigned char **samples,
@@ -1310,6 +1981,9 @@ static int decode_flag0(Cur *c, uint64_t band_end, int version, int rows, int co
 		if (mode != 0) {
 			if ((dt == 0 || dt == 1) && (mode == 1 || (mode == 2 && version >= 4)))
 				return huffman_pull(c, band_end, rows, cols, depth, dt, mode, bits, samples,
+					sample_bytes, withhold);
+			if ((dt == 6 || dt == 7) && mode == 3)
+				return float_huffman_pull(c, band_end, rows, cols, depth, dt, samples,
 					sample_bytes, withhold);
 			add_finding(c, at, 1, 1, LERC_STREAM_CODE_UNSUPPORTED, LERC_STREAM_CAT_UNSUPPORTED);
 			*withhold = 1;

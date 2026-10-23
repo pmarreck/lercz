@@ -8,10 +8,9 @@ Maintenance guidance: [fork maintenance](doc/FORK_MAINTENANCE.md).
 - [x] Parse stored RLE masks in the forward-only Lerc2 validation API, including a later band that reuses the previous mask, and check them against the blob decoder (context: docs/plan_context/stream-parser.md). (done 2026-10-23 11:47 EDT)
 - [x] Parse tiled bit-stuffing in the forward-only Lerc2 validation API and check it against the blob decoder (context: docs/plan_context/stream-parser.md). (done 2026-10-23 12:45 EDT)
 - [x] Parse byte and char Huffman in the forward-only Lerc2 validation API and check it against the blob decoder (context: docs/plan_context/stream-parser.md). (done 2026-10-23 12:59 EDT)
-- [ ] Parse lossless float and double Huffman in that validation API without calling the blob decoder (context: docs/plan_context/stream-parser.md).
+- [x] Parse lossless float and double Huffman in that validation API without calling the blob decoder (context: docs/plan_context/stream-parser.md). (done 2026-10-23 13:19 EDT)
 
 ## C CLI and corruption detection
-- [x] Finish the version-bit corruption regression: ReleaseSafe rejects the version-field mutation instead of trapping in ReadTile. (done 2026-10-21 15:14 EDT)
 - [x] Build a C CLI over the public LERC C ABI with encode, decode, check, info, standard stream/options, and regression tests. (done 2026-10-21 15:23 EDT)
 - [x] Add corruption-coverage using corruption-reader sniper/bolter/shotgun/nuke, clean controls, replayable cases, and 95% confidence intervals. (done 2026-10-21 15:23 EDT)
 - [x] Render human coverage tables through tsv_to_ansi_table while retaining machine-readable results. (done 2026-10-21 15:23 EDT)
